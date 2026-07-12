@@ -1,0 +1,8 @@
+BaileysExo includes protocol structures and algorithms ported from Baileys,
+Copyright (c) 2025 Rajeh Taher/WhiskeySockets, under the MIT License.
+
+The XEdDSA implementation in lib/baileys_exo/crypto/xeddsa.ex is adapted from
+Amarula, Copyright (c) 2026 Roberto Trevisan, under the MIT License.
+
+Both upstream projects are independent implementations of an unofficial
+WhatsApp Web protocol and are not affiliated with WhatsApp.
