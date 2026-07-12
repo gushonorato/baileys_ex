@@ -4,7 +4,7 @@ defmodule BaileysExo.Messages.Sender do
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.Node
   alias Baileys.SentMessage
-  alias BaileysExo.{ConnectionProcess, Crypto, JID}
+  alias BaileysExo.{ConnectionProcess, JID}
   alias BaileysExo.Protocol.USync
   alias BaileysExo.Proto.Message
   alias BaileysExo.Signal.{SessionBuilder, SessionCipher}
@@ -140,15 +140,12 @@ defmodule BaileysExo.Messages.Sender do
         content
       end
 
-    jids = Enum.map(participants, &elem(&1, 0))
-
     %Node{
       tag: "message",
       attrs: %{
         "id" => id,
         "to" => recipient,
-        "type" => "text",
-        "phash" => participant_hash(jids)
+        "type" => "text"
       },
       content: content
     }
@@ -176,11 +173,6 @@ defmodule BaileysExo.Messages.Sender do
   end
 
   defp session_address(credentials, jid), do: wire_jid(credentials, jid)
-
-  defp participant_hash(jids) do
-    digest = jids |> Enum.sort() |> Enum.join() |> Crypto.sha256() |> Base.encode64()
-    "2:" <> binary_part(digest, 0, 6)
-  end
 
   defp message_id, do: "3EB0" <> (:crypto.strong_rand_bytes(9) |> Base.encode16(case: :upper))
 end
