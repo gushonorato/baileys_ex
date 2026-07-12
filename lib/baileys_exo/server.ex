@@ -10,11 +10,13 @@ defmodule BaileysExo.Server do
   @client_options [:session, :sessions_path, :request_timeout]
 
   def start_link(module, init_arg, options) do
-    GenServer.start_link(
-      __MODULE__,
-      {module, init_arg, options},
-      Keyword.take(options, @gen_server_options)
-    )
+    with :ok <- validate_sessions_path(options) do
+      GenServer.start_link(
+        __MODULE__,
+        {module, init_arg, options},
+        Keyword.take(options, @gen_server_options)
+      )
+    end
   end
 
   @impl true
@@ -107,4 +109,19 @@ defmodule BaileysExo.Server do
   defp normalize_init({:stop, reason}), do: {:error, reason}
   defp normalize_init(:ignore), do: :ignore
   defp normalize_init(other), do: {:error, {:bad_init_return, other}}
+
+  defp validate_sessions_path(options) do
+    case Keyword.fetch(options, :sessions_path) do
+      {:ok, path} when is_binary(path) ->
+        if Path.type(path) == :absolute,
+          do: :ok,
+          else: {:error, :sessions_path_must_be_absolute}
+
+      {:ok, _path} ->
+        {:error, :invalid_sessions_path}
+
+      :error ->
+        {:error, :sessions_path_required}
+    end
+  end
 end

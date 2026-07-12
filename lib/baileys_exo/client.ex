@@ -32,7 +32,7 @@ defmodule BaileysExo.Client do
   @impl true
   def init(options) do
     session = Keyword.get(options, :session, "default")
-    sessions_path = Keyword.get(options, :sessions_path, "baileys_sessions")
+    sessions_path = Keyword.get(options, :sessions_path)
 
     with :ok <- validate_session(session),
          {:ok, credentials, session_path} <- FileStore.load_or_create(sessions_path, session) do
@@ -121,7 +121,7 @@ defmodule BaileysExo.Client do
              {:ok, credentials, session_path} <-
                FileStore.load_or_create(
                  Path.dirname(state.session_path),
-                 Path.basename(state.session_path)
+                 Path.basename(state.session_path, ".json")
                ) do
           {:reply, :ok,
            %{

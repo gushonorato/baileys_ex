@@ -4,7 +4,7 @@ defmodule HelloWorld do
   def start_link(phone) do
     Baileys.start_link(__MODULE__, phone,
       session: "hello_world",
-      sessions_path: "baileys_sessions"
+      sessions_path: Path.expand("baileys_sessions", __DIR__)
     )
   end
 

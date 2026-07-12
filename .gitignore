@@ -9,6 +9,7 @@
 
 # Default location for WhatsApp credentials and Signal sessions.
 /baileys_sessions/
+/examples/baileys_sessions/
 
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/

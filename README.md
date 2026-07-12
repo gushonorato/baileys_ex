@@ -29,7 +29,7 @@ defmodule MyWhatsApp do
     Baileys.start_link(__MODULE__, phone,
       name: __MODULE__,
       session: "primary",
-      sessions_path: "./baileys_sessions"
+      sessions_path: Path.expand("baileys_sessions")
     )
   end
 
@@ -59,12 +59,14 @@ end
 `client` field can be used for synchronous commands inside the callback without
 calling the callback process itself.
 
-Credentials, prekeys and Signal sessions are persisted under
-`sessions_path/session/session.json` using a versioned schema and Base64 for
-binary fields. Existing `session.etf` files are safely migrated on first load.
-The directory and file modes are `0700` and `0600`. Do not run two clients
-against the same session. Base64 is an encoding, not encryption; the JSON file
-contains secrets and must not be shared or committed.
+`sessions_path` is required and must be absolute. Credentials, prekeys and
+Signal sessions are persisted as `<sessions_path>/<session>.json` using a
+versioned schema and Base64 for binary fields. Files from the previous
+`<sessions_path>/<session>/session.json` layout and legacy `session.etf` files
+are safely migrated on first load. The directory and file modes are `0700` and
+`0600`. Do not run two clients against the same session. Base64 is an encoding,
+not encryption; the JSON file contains secrets and must not be shared or
+committed.
 
 ## QR Pairing
 

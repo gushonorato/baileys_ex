@@ -4,7 +4,11 @@ defmodule Baileys do
 
   A callback module starts with the same shape as a `GenServer`:
 
-      Baileys.start_link(MyHandler, init_arg, name: MyHandler, session: "primary")
+      Baileys.start_link(MyHandler, init_arg,
+        name: MyHandler,
+        session: "primary",
+        sessions_path: "/var/lib/my_app/baileys_sessions"
+      )
 
   Events are delivered to `c:handle_event/2` as `%Baileys.Event{}` values.
   """
@@ -43,7 +47,12 @@ defmodule Baileys do
     end
   end
 
-  @doc "Starts a callback module using `GenServer.start_link/3`-style arguments."
+  @doc """
+  Starts a callback module using `GenServer.start_link/3`-style arguments.
+
+  `:sessions_path` is required and must be absolute. Each session is persisted
+  as `<sessions_path>/<session>.json`.
+  """
   @spec start_link(module(), term(), keyword()) :: GenServer.on_start()
   def start_link(module, init_arg, options \\ []) when is_atom(module) and is_list(options) do
     Server.start_link(module, init_arg, options)

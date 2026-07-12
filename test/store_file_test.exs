@@ -7,37 +7,58 @@ defmodule BaileysExo.Store.FileTest do
 
   test "round trips credentials through versioned JSON" do
     root = temporary_root()
+    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
-    path = Path.join(root, "safe")
-    File.mkdir_p!(path)
+    path = Path.join(root, "safe.json")
     assert :ok = FileStore.save(path, credentials)
 
     assert {:ok, %{"version" => 1}} =
-             path |> Path.join("session.json") |> File.read!() |> Jason.decode()
+             path |> File.read!() |> Jason.decode()
 
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "safe")
   end
 
-  test "migrates safe legacy ETF and removes it" do
+  test "migrates JSON from the session directory and removes the empty directory" do
     root = temporary_root()
-    path = Path.join(root, "legacy")
-    File.mkdir_p!(path)
+    legacy_directory = Path.join(root, "legacy-json")
+    legacy_path = Path.join(legacy_directory, "session.json")
+    path = Path.join(root, "legacy-json.json")
+    File.mkdir_p!(legacy_directory)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
-    File.write!(Path.join(path, "session.etf"), :erlang.term_to_binary(credentials))
+    assert :ok = FileStore.save(legacy_path, credentials)
+
+    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy-json")
+    assert File.exists?(path)
+    refute File.exists?(legacy_directory)
+  end
+
+  test "migrates safe legacy ETF and removes it" do
+    root = temporary_root()
+    legacy_directory = Path.join(root, "legacy")
+    path = Path.join(root, "legacy.json")
+    File.mkdir_p!(legacy_directory)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    credentials = Credentials.new()
+
+    File.write!(
+      Path.join(legacy_directory, "session.etf"),
+      :erlang.term_to_binary(credentials)
+    )
 
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy")
-    assert File.exists?(Path.join(path, "session.json"))
-    refute File.exists?(Path.join(path, "session.etf"))
+    assert File.exists?(path)
+    refute File.exists?(legacy_directory)
   end
 
   test "round trips prekeys, protobuf account and Signal sessions" do
     root = temporary_root()
-    path = Path.join(root, "paired")
-    File.mkdir_p!(path)
+    path = Path.join(root, "paired.json")
+    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = paired_credentials()
@@ -48,46 +69,49 @@ defmodule BaileysExo.Store.FileTest do
 
   test "rejects an unsupported JSON schema version" do
     root = temporary_root()
-    path = Path.join(root, "future")
-    File.mkdir_p!(path)
+    path = Path.join(root, "future.json")
+    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
-    File.write!(
-      Path.join(path, "session.json"),
-      Jason.encode!(%{"version" => 2, "credentials" => %{}})
-    )
+    File.write!(path, Jason.encode!(%{"version" => 2, "credentials" => %{}}))
 
     assert {:error, :unsupported_session_version} = FileStore.load_or_create(root, "future")
   end
 
   test "rejects malformed Base64 in JSON credentials" do
     root = temporary_root()
-    path = Path.join(root, "malformed")
-    File.mkdir_p!(path)
+    path = Path.join(root, "malformed.json")
+    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
     assert :ok = FileStore.save(path, credentials)
 
-    session_path = Path.join(path, "session.json")
-    document = session_path |> File.read!() |> Jason.decode!()
+    document = path |> File.read!() |> Jason.decode!()
     document = put_in(document, ["credentials", "adv_secret_key"], "not base64!")
-    File.write!(session_path, Jason.encode!(document))
+    File.write!(path, Jason.encode!(document))
 
     assert {:error, :invalid_credentials} = FileStore.load_or_create(root, "malformed")
   end
 
   test "rejects legacy ETF containing an atom outside the persisted schema" do
     root = temporary_root()
-    path = Path.join(root, "unsafe")
-    File.mkdir_p!(path)
+    legacy_directory = Path.join(root, "unsafe")
+    File.mkdir_p!(legacy_directory)
     on_exit(fn -> File.rm_rf!(root) end)
 
     atom_name = "baileys_untrusted_atom_#{System.unique_integer([:positive])}"
     encoded = <<131, 100, byte_size(atom_name)::16, atom_name::binary>>
-    File.write!(Path.join(path, "session.etf"), encoded)
+    File.write!(Path.join(legacy_directory, "session.etf"), encoded)
 
     assert {:error, :invalid_credentials} = FileStore.load_or_create(root, "unsafe")
+  end
+
+  test "requires an absolute sessions path" do
+    assert {:error, :sessions_path_required} = FileStore.load_or_create(nil, "missing")
+
+    assert {:error, :sessions_path_must_be_absolute} =
+             FileStore.load_or_create("relative/sessions", "relative")
   end
 
   defp temporary_root do

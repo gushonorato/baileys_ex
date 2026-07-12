@@ -4,7 +4,8 @@ defmodule BaileysExo.Store.File do
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Store.JSONCodec
 
-  @filename "session.json"
+  @json_extension ".json"
+  @legacy_json_filename "session.json"
   @legacy_filename "session.etf"
   @max_session_bytes 10 * 1024 * 1024
   @persisted_atoms [
@@ -66,27 +67,26 @@ defmodule BaileysExo.Store.File do
   ]
 
   def load_or_create(root, session) do
-    path = session_path(root, session)
-
-    with :ok <- File.mkdir_p(path),
-         :ok <- File.chmod(path, 0o700) do
-      case load(path) do
+    with :ok <- validate_root(root),
+         path = session_path(root, session),
+         :ok <- File.mkdir_p(root),
+         :ok <- File.chmod(root, 0o700) do
+      case load_json(path) do
         {:ok, credentials} -> {:ok, credentials, path}
-        {:error, :enoent} -> create(path)
+        {:error, :enoent} -> migrate_or_create(root, session, path)
         {:error, reason} -> {:error, reason}
       end
     end
   end
 
   def save(path, %Credentials{} = credentials) do
-    destination = Path.join(path, @filename)
-    temporary = destination <> ".tmp-#{System.unique_integer([:positive])}"
+    temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
 
     with {:ok, encoded} <- JSONCodec.encode(credentials),
          true <- byte_size(encoded) <= @max_session_bytes || {:error, :session_too_large},
          :ok <- File.write(temporary, encoded, [:binary, :exclusive]),
          :ok <- File.chmod(temporary, 0o600),
-         :ok <- File.rename(temporary, destination) do
+         :ok <- File.rename(temporary, path) do
       :ok
     else
       error ->
@@ -96,22 +96,15 @@ defmodule BaileysExo.Store.File do
   end
 
   def reset(path) do
-    with {:ok, _files} <- File.rm_rf(path),
-         :ok <- File.mkdir_p(path),
-         :ok <- File.chmod(path, 0o700) do
-      :ok
-    end
-  end
-
-  defp load(path) do
-    case load_json(path) do
-      {:error, :enoent} -> migrate_legacy(path)
-      result -> result
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
   defp load_json(path) do
-    with {:ok, encoded} <- File.read(Path.join(path, @filename)),
+    with {:ok, encoded} <- File.read(path),
          true <- byte_size(encoded) <= @max_session_bytes || {:error, :session_too_large} do
       JSONCodec.decode(encoded)
     else
@@ -119,13 +112,40 @@ defmodule BaileysExo.Store.File do
     end
   end
 
-  defp migrate_legacy(path) do
-    legacy_path = Path.join(path, @legacy_filename)
+  defp migrate_or_create(root, session, path) do
+    legacy_directory = Path.join(root, session)
+    legacy_json_path = Path.join(legacy_directory, @legacy_json_filename)
 
-    with {:ok, credentials} <- load_legacy(legacy_path),
-         :ok <- save(path, credentials),
-         :ok <- File.rm(legacy_path) do
-      {:ok, credentials}
+    case load_json(legacy_json_path) do
+      {:ok, credentials} -> migrate(path, legacy_json_path, legacy_directory, credentials)
+      {:error, :enoent} -> migrate_legacy_etf(path, legacy_directory)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp migrate_legacy_etf(path, legacy_directory) do
+    legacy_path = Path.join(legacy_directory, @legacy_filename)
+
+    case load_legacy(legacy_path) do
+      {:ok, credentials} -> migrate(path, legacy_path, legacy_directory, credentials)
+      {:error, :enoent} -> create(path)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp migrate(path, legacy_path, legacy_directory, credentials) do
+    with :ok <- save(path, credentials),
+         :ok <- File.rm(legacy_path),
+         :ok <- remove_legacy_directory(legacy_directory) do
+      {:ok, credentials, path}
+    end
+  end
+
+  defp remove_legacy_directory(path) do
+    case File.rmdir(path) do
+      :ok -> :ok
+      {:error, reason} when reason in [:enoent, :eexist, :enotempty] -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -157,8 +177,18 @@ defmodule BaileysExo.Store.File do
   end
 
   defp session_path(root, session) do
-    root |> Path.expand() |> Path.join(session)
+    Path.join(root, session <> @json_extension)
   end
+
+  defp validate_root(nil), do: {:error, :sessions_path_required}
+
+  defp validate_root(root) when is_binary(root) do
+    if Path.type(root) == :absolute,
+      do: :ok,
+      else: {:error, :sessions_path_must_be_absolute}
+  end
+
+  defp validate_root(_root), do: {:error, :invalid_sessions_path}
 
   # Force every allowed atom into the VM before safe ETF decoding. Keeping this
   # operation observable prevents the compiler from removing the literal table.
