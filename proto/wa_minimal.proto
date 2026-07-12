@@ -227,6 +227,15 @@ message Message {
   optional string conversation = 1;
   optional ExtendedTextMessage extendedTextMessage = 6;
   optional DeviceSentMessage deviceSentMessage = 31;
+  optional FutureProofMessage viewOnceMessage = 37;
+  optional FutureProofMessage ephemeralMessage = 40;
+  optional FutureProofMessage documentWithCaptionMessage = 53;
+  optional FutureProofMessage viewOnceMessageV2 = 55;
+  optional FutureProofMessage editedMessage = 58;
+  optional FutureProofMessage viewOnceMessageV2Extension = 59;
+  optional FutureProofMessage associatedChildMessage = 91;
+  optional FutureProofMessage groupStatusMessage = 96;
+  optional FutureProofMessage groupStatusMessageV2 = 103;
 
   message ExtendedTextMessage {
     optional string text = 1;
@@ -236,6 +245,10 @@ message Message {
     optional string destinationJid = 1;
     optional Message message = 2;
     optional string phash = 3;
+  }
+
+  message FutureProofMessage {
+    optional Message message = 1;
   }
 }
 

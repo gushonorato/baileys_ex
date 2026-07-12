@@ -528,6 +528,17 @@ defmodule BaileysExo.Proto.Message.DeviceSentMessage do
   field(:phash, 3, proto3_optional: true, type: :string)
 end
 
+defmodule BaileysExo.Proto.Message.FutureProofMessage do
+  @moduledoc false
+
+  use Protobuf,
+    full_name: "baileys_exo.proto.Message.FutureProofMessage",
+    protoc_gen_elixir_version: "0.17.0",
+    syntax: :proto3
+
+  field(:message, 1, proto3_optional: true, type: BaileysExo.Proto.Message)
+end
+
 defmodule BaileysExo.Proto.Message do
   @moduledoc false
 
@@ -546,6 +557,51 @@ defmodule BaileysExo.Proto.Message do
   field(:deviceSentMessage, 31,
     proto3_optional: true,
     type: BaileysExo.Proto.Message.DeviceSentMessage
+  )
+
+  field(:viewOnceMessage, 37,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:ephemeralMessage, 40,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:documentWithCaptionMessage, 53,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:viewOnceMessageV2, 55,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:editedMessage, 58,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:viewOnceMessageV2Extension, 59,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:associatedChildMessage, 91,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:groupStatusMessage, 96,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
+  )
+
+  field(:groupStatusMessageV2, 103,
+    proto3_optional: true,
+    type: BaileysExo.Proto.Message.FutureProofMessage
   )
 end
 

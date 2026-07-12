@@ -4,6 +4,7 @@ defmodule BaileysExo.Messages.ReceiverTest do
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.Node
   alias BaileysExo.Messages.Receiver
+  alias BaileysExo.Proto.Message
 
   setup do
     credentials = %Credentials{
@@ -33,6 +34,25 @@ defmodule BaileysExo.Messages.ReceiverTest do
     assert context.signal_jid == "987654321@lid"
     refute context.from_me
     assert context.receipt_attrs == %{"id" => "incoming-1", "to" => node.attrs["from"]}
+  end
+
+  test "exposes the phone JID for a LID-addressed direct message", %{credentials: credentials} do
+    node = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "incoming-lid-1",
+        "from" => "987654321@lid",
+        "sender_pn" => "5521999999999@s.whatsapp.net",
+        "addressing_mode" => "lid",
+        "t" => "1"
+      }
+    }
+
+    assert {:ok, context} = Receiver.context(node, credentials)
+    assert context.chat_jid == "5521999999999@s.whatsapp.net"
+    assert context.sender_jid == "5521999999999@s.whatsapp.net"
+    assert context.signal_jid == "987654321@lid"
+    assert context.receipt_attrs == %{"id" => "incoming-lid-1", "to" => "987654321@lid"}
   end
 
   test "uses the recipient as chat for a message synchronized from another device", %{
@@ -110,6 +130,33 @@ defmodule BaileysExo.Messages.ReceiverTest do
                "to" => "5521999999999@s.whatsapp.net",
                "type" => "text"
              }
+           }
+  end
+
+  test "extracts text from nested future-proof message wrappers" do
+    text = %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: "recebida"}}
+
+    message = %Message{
+      ephemeralMessage: %Message.FutureProofMessage{
+        message: %Message{
+          editedMessage: %Message.FutureProofMessage{message: text}
+        }
+      }
+    }
+
+    encoded = Protobuf.encode(message)
+    assert {:ok, "recebida"} = encoded |> Message.decode() |> Receiver.extract_text()
+  end
+
+  test "requests pending notifications after an offline preview" do
+    preview = %Node{tag: "ib", content: [%Node{tag: "offline_preview"}]}
+
+    assert {:ok, request} = Receiver.offline_batch_request(preview)
+
+    assert request == %Node{
+             tag: "ib",
+             attrs: %{},
+             content: [%Node{tag: "offline_batch", attrs: %{"count" => "100"}}]
            }
   end
 end

@@ -409,17 +409,12 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(%Node{tag: "ib"} = node, state) do
-    with %Node{} = edge <- NodeUtils.child(node, "edge_routing"),
-         %Node{content: routing_info} when is_binary(routing_info) <-
-           NodeUtils.child(edge, "routing_info") do
-      credentials = %{state.credentials | routing_info: routing_info}
+    case Receiver.offline_batch_request(node) do
+      {:ok, request} ->
+        send_node(request, state)
 
-      with :ok <- persist_credentials(state.session_path, credentials) do
-        send(state.owner, {:connection_event, {:credentials, credentials}})
-        {:ok, %{state | credentials: credentials}}
-      end
-    else
-      _missing -> {:ok, state}
+      :ignore ->
+        handle_ib_node(node, state)
     end
   end
 
@@ -445,6 +440,27 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(_node, state), do: {:ok, state}
+
+  defp handle_ib_node(node, state) do
+    case NodeUtils.child(node, "edge_routing") do
+      %Node{} = edge ->
+        case NodeUtils.child(edge, "routing_info") do
+          %Node{content: routing_info} when is_binary(routing_info) ->
+            credentials = %{state.credentials | routing_info: routing_info}
+
+            with :ok <- persist_credentials(state.session_path, credentials) do
+              send(state.owner, {:connection_event, {:credentials, credentials}})
+              {:ok, %{state | credentials: credentials}}
+            end
+
+          _missing ->
+            {:ok, state}
+        end
+
+      nil ->
+        {:ok, state}
+    end
+  end
 
   defp finish_login(state) do
     if state.credentials.first_unuploaded_pre_key_id == 1 do
@@ -539,9 +555,8 @@ defmodule BaileysExo.ConnectionProcess do
           do: %{credentials | pre_keys: Map.delete(credentials.pre_keys, used_pre_key)},
           else: credentials
 
-      case message.conversation ||
-             (message.extendedTextMessage && message.extendedTextMessage.text) do
-        text when is_binary(text) ->
+      case Receiver.extract_text(message) do
+        {:ok, text} ->
           metadata = %{
             id: context.id,
             chat_jid: context.chat_jid,
@@ -553,7 +568,7 @@ defmodule BaileysExo.ConnectionProcess do
 
           {:ok, text, credentials, metadata, context.receipt_attrs}
 
-        _unsupported ->
+        :unsupported ->
           {:ignored, credentials, context.receipt_attrs}
       end
     else

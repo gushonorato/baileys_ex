@@ -2,8 +2,9 @@ defmodule BaileysExo.Messages.Receiver do
   @moduledoc false
 
   alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.Node
+  alias BaileysExo.Binary.{Node, NodeUtils}
   alias BaileysExo.JID
+  alias BaileysExo.Proto.Message
 
   @nack_unhandled_error "500"
 
@@ -11,9 +12,17 @@ defmodule BaileysExo.Messages.Receiver do
     with id when is_binary(id) <- attrs["id"],
          from when is_binary(from) <- attrs["from"] do
       from_me = own_jid?(from, me)
-      chat_jid = if from_me, do: attrs["recipient"] || from, else: from
-      sender_jid = attrs["participant"] || from
-      signal_jid = attrs["sender_lid"] || sender_jid
+      sender = attrs["participant"] || from
+      lid_addressed? = attrs["addressing_mode"] == "lid" || String.ends_with?(sender, "@lid")
+      sender_alt = if lid_addressed?, do: phone_sender(attrs)
+      wire_chat_jid = if from_me, do: attrs["recipient"] || from, else: from
+      chat_jid = display_chat_jid(attrs, wire_chat_jid, sender_alt, from_me, lid_addressed?)
+      sender_jid = sender_alt || sender
+
+      signal_jid =
+        if lid_addressed?,
+          do: sender,
+          else: attrs["participant_lid"] || attrs["sender_lid"] || sender
 
       {:ok,
        %{
@@ -24,7 +33,7 @@ defmodule BaileysExo.Messages.Receiver do
          from_me: from_me,
          timestamp: parse_integer(attrs["t"]) || System.system_time(:second),
          offline: Map.has_key?(attrs, "offline"),
-         receipt_attrs: receipt_attrs(attrs, id, from, chat_jid, from_me)
+         receipt_attrs: receipt_attrs(attrs, id, from, wire_chat_jid, from_me)
        }}
     else
       _missing -> {:error, :invalid_message_stanza}
@@ -54,6 +63,59 @@ defmodule BaileysExo.Messages.Receiver do
 
   def failure_ack(node, credentials), do: ack(node, credentials, @nack_unhandled_error)
 
+  def offline_batch_request(%Node{tag: "ib"} = node) do
+    if NodeUtils.child(node, "offline_preview") do
+      {:ok,
+       %Node{
+         tag: "ib",
+         content: [%Node{tag: "offline_batch", attrs: %{"count" => "100"}}]
+       }}
+    else
+      :ignore
+    end
+  end
+
+  def offline_batch_request(_node), do: :ignore
+
+  @doc false
+  def extract_text(%Message{} = message), do: extract_text(message, 0)
+
+  defp extract_text(%Message{} = message, depth) when depth < 5 do
+    text =
+      message.conversation ||
+        (message.extendedTextMessage && message.extendedTextMessage.text)
+
+    if is_binary(text) do
+      {:ok, text}
+    else
+      message
+      |> wrapped_message()
+      |> case do
+        %Message{} = inner -> extract_text(inner, depth + 1)
+        _missing -> :unsupported
+      end
+    end
+  end
+
+  defp extract_text(_message, _depth), do: :unsupported
+
+  defp wrapped_message(message) do
+    Enum.find_value(
+      [
+        message.ephemeralMessage,
+        message.viewOnceMessage,
+        message.documentWithCaptionMessage,
+        message.viewOnceMessageV2,
+        message.viewOnceMessageV2Extension,
+        message.editedMessage,
+        message.associatedChildMessage,
+        message.groupStatusMessage,
+        message.groupStatusMessageV2
+      ],
+      &(&1 && &1.message)
+    )
+  end
+
   defp receipt_attrs(attrs, id, from, chat_jid, true) do
     %{"id" => id, "to" => from, "recipient" => chat_jid, "type" => "sender"}
     |> maybe_put("participant", attrs["participant"])
@@ -63,6 +125,21 @@ defmodule BaileysExo.Messages.Receiver do
     %{"id" => id, "to" => from}
     |> maybe_put("participant", attrs["participant"])
   end
+
+  defp phone_sender(attrs) do
+    attrs["participant_pn"] || attrs["sender_pn"] || attrs["peer_recipient_pn"]
+  end
+
+  defp display_chat_jid(attrs, wire_chat_jid, _sender_alt, true, true) do
+    attrs["recipient_pn"] || wire_chat_jid
+  end
+
+  defp display_chat_jid(_attrs, _wire_chat_jid, sender_alt, false, true)
+       when is_binary(sender_alt),
+       do: sender_alt
+
+  defp display_chat_jid(_attrs, wire_chat_jid, _sender_alt, _from_me, _lid_addressed?),
+    do: wire_chat_jid
 
   defp own_jid?(jid, me) do
     Enum.any?([me[:id], me[:lid]], &same_user?(jid, &1))
