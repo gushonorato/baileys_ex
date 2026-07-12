@@ -115,6 +115,24 @@ sends `Hello world`:
 mix run examples/hello_world.exs +5511999999999
 ```
 
+## Interactive CLI
+
+The interactive example sends and receives direct text messages without an
+additional terminal UI dependency:
+
+```sh
+mix run examples/whatsapp_cli.exs
+```
+
+Use `/chat <phone>` to select the active conversation. The prompt always shows
+the selected phone, and incoming messages include their source phone so that
+messages from other conversations remain identifiable. Use `/help` to list the
+available commands and `/quit` to exit.
+
+The example uses `IO.gets/1`, which is sufficient for a small CLI. A full-screen
+application that must preserve partially typed input while asynchronous
+messages arrive should use a terminal UI/readline library.
+
 ## Event Types
 
 ```elixir

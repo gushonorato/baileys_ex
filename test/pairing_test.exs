@@ -2,7 +2,7 @@ defmodule BaileysExo.Protocol.PairingTest do
   use ExUnit.Case, async: true
 
   alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.{Codec, NodeUtils}
+  alias BaileysExo.Binary.{Codec, Node, NodeUtils}
   alias BaileysExo.Protocol.Pairing
 
   test "builds an eight-character pairing-code request" do
@@ -17,12 +17,29 @@ defmodule BaileysExo.Protocol.PairingTest do
 
     registration = NodeUtils.child(node, "link_code_companion_reg")
     wrapped = NodeUtils.child(registration, "link_code_pairing_wrapped_companion_ephemeral_pub")
+    assert %Node{content: {:text, "1"}} = NodeUtils.child(registration, "companion_platform_id")
+
+    assert %Node{content: {:text, "Chrome (Mac OS)"}} =
+             NodeUtils.child(registration, "companion_platform_display")
+
     assert byte_size(wrapped.content) == 80
     assert {:ok, decoded} = node |> Codec.encode() |> Codec.decode()
     assert decoded.tag == "iq"
 
     assert NodeUtils.child(decoded, "link_code_companion_reg").attrs["stage"] ==
              "companion_hello"
+  end
+
+  test "builds QR data with the Chrome companion platform" do
+    credentials = Credentials.new()
+    payload = Pairing.qr_payload("reference", credentials)
+
+    assert String.starts_with?(
+             payload,
+             "https://wa.me/settings/linked_devices#reference,#{Base.encode64(credentials.noise_key.public)},"
+           )
+
+    assert String.ends_with?(payload, ",1")
   end
 
   test "rejects invalid phone numbers and custom codes" do

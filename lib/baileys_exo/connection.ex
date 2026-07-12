@@ -9,6 +9,7 @@ defmodule BaileysExo.ConnectionProcess do
   alias BaileysExo.Protocol.Handshake
   alias BaileysExo.Protocol.Pairing
   alias BaileysExo.Proto.Message
+  alias BaileysExo.Messages.Receiver
   alias BaileysExo.Signal.SessionCipher
   alias BaileysExo.Signal.PreKeys
   alias BaileysExo.Store.File, as: FileStore
@@ -359,26 +360,23 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(%Node{tag: "message"} = node, state) do
-    case decrypt_message(node, state.credentials) do
-      {:ok, text, credentials, metadata} ->
-        receipt_attrs =
-          %{"id" => node.attrs["id"], "to" => node.attrs["from"]}
-          |> maybe_put("participant", node.attrs["participant"])
+    if NodeUtils.child(node, "enc") do
+      case decrypt_message(node, state.credentials) do
+        {:ok, text, credentials, metadata, receipt_attrs} ->
+          with {:ok, state} <- acknowledge_message(credentials, receipt_attrs, state) do
+            send(state.owner, {:connection_event, {:text_message, metadata, text}})
+            {:ok, state}
+          end
 
-        with :ok <- persist_credentials(state.session_path, credentials),
-             {:ok, state} <-
-               send_node(%Node{tag: "receipt", attrs: receipt_attrs}, %{
-                 state
-                 | credentials: credentials
-               }) do
-          send(state.owner, {:connection_event, {:credentials, credentials}})
-          send(state.owner, {:connection_event, {:text_message, metadata, text}})
-          {:ok, state}
-        end
+        {:ignored, credentials, receipt_attrs} ->
+          acknowledge_message(credentials, receipt_attrs, state)
 
-      {:error, reason} ->
-        send(state.owner, {:connection_event, {:error, {:message_decrypt_failed, reason}}})
-        {:ok, state}
+        {:error, reason} ->
+          send(state.owner, {:connection_event, {:error, {:message_decrypt_failed, reason}}})
+          send_node(Receiver.failure_ack(node, state.credentials), state)
+      end
+    else
+      send_node(Receiver.ack(node, state.credentials), state)
     end
   end
 
@@ -497,20 +495,7 @@ defmodule BaileysExo.ConnectionProcess do
   defp emit_next_qr(%{qr_refs: []} = state), do: state
 
   defp emit_next_qr(%{qr_refs: [reference | refs]} = state) do
-    credentials = state.credentials
-
-    payload =
-      "https://wa.me/settings/linked_devices#" <>
-        Enum.join(
-          [
-            reference,
-            Base.encode64(credentials.noise_key.public),
-            Base.encode64(credentials.signed_identity_key.public),
-            Base.encode64(credentials.adv_secret_key),
-            "7"
-          ],
-          ","
-        )
+    payload = Pairing.qr_payload(reference, state.credentials)
 
     send(state.owner, {:connection_event, {:qr, payload}})
     timeout = if state.qr_count == 0, do: 60_000, else: 20_000
@@ -537,21 +522,16 @@ defmodule BaileysExo.ConnectionProcess do
   defp decrypt_message(node, credentials) do
     encrypted = NodeUtils.child(node, "enc")
 
-    with %Node{content: ciphertext} <- encrypted,
+    with {:ok, context} <- Receiver.context(node, credentials),
+         %Node{content: ciphertext} <- encrypted,
          true <- is_binary(ciphertext),
-         sender <-
-           node.attrs["sender_lid"] || node.attrs["participant"] || node.attrs["from"],
-         true <- is_binary(sender),
-         address <- normalize_signal_address(sender),
+         address <- normalize_signal_address(context.signal_jid),
          record <- credentials.sessions[address],
          {:ok, plaintext, record, used_pre_key} <-
            decrypt_signal(encrypted.attrs["type"], record, ciphertext, credentials),
          {:ok, unpadded} <- unpad_message(plaintext),
          message <- Message.decode(unpadded),
-         message <- (message.deviceSentMessage && message.deviceSentMessage.message) || message,
-         text when is_binary(text) <-
-           message.conversation ||
-             (message.extendedTextMessage && message.extendedTextMessage.text) do
+         message <- (message.deviceSentMessage && message.deviceSentMessage.message) || message do
       credentials = put_in(credentials.sessions[address], record)
 
       credentials =
@@ -559,18 +539,23 @@ defmodule BaileysExo.ConnectionProcess do
           do: %{credentials | pre_keys: Map.delete(credentials.pre_keys, used_pre_key)},
           else: credentials
 
-      timestamp = parse_integer(node.attrs["t"]) || System.system_time(:second)
+      case message.conversation ||
+             (message.extendedTextMessage && message.extendedTextMessage.text) do
+        text when is_binary(text) ->
+          metadata = %{
+            id: context.id,
+            chat_jid: context.chat_jid,
+            sender_jid: context.sender_jid,
+            from_me: context.from_me,
+            timestamp: context.timestamp,
+            offline: context.offline
+          }
 
-      metadata = %{
-        id: node.attrs["id"],
-        chat_jid: node.attrs["from"],
-        sender_jid: sender,
-        from_me: false,
-        timestamp: timestamp,
-        offline: Map.has_key?(node.attrs, "offline")
-      }
+          {:ok, text, credentials, metadata, context.receipt_attrs}
 
-      {:ok, text, credentials, metadata}
+        _unsupported ->
+          {:ignored, credentials, context.receipt_attrs}
+      end
     else
       nil -> {:error, :missing_encrypted_message}
       false -> {:error, :invalid_encrypted_message}
@@ -579,6 +564,18 @@ defmodule BaileysExo.ConnectionProcess do
     end
   rescue
     error -> {:error, error}
+  end
+
+  defp acknowledge_message(credentials, receipt_attrs, state) do
+    with :ok <- persist_credentials(state.session_path, credentials),
+         {:ok, state} <-
+           send_node(%Node{tag: "receipt", attrs: receipt_attrs}, %{
+             state
+             | credentials: credentials
+           }) do
+      send(state.owner, {:connection_event, {:credentials, credentials}})
+      {:ok, state}
+    end
   end
 
   defp decrypt_signal("pkmsg", record, ciphertext, credentials) do
@@ -613,18 +610,6 @@ defmodule BaileysExo.ConnectionProcess do
     case BaileysExo.JID.decode(jid) do
       {:ok, decoded} -> BaileysExo.JID.encode(decoded.user, decoded.server, decoded.device)
       {:error, :invalid_jid} -> jid
-    end
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp parse_integer(nil), do: nil
-
-  defp parse_integer(value) do
-    case Integer.parse(value) do
-      {integer, ""} -> integer
-      _invalid -> nil
     end
   end
 
