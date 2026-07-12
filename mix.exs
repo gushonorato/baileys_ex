@@ -14,7 +14,7 @@ defmodule BaileysExo.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:crypto, :logger, :ssl],
       mod: {BaileysExo.Application, []}
     ]
   end
@@ -22,8 +22,12 @@ defmodule BaileysExo.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
+      {:castore, "~> 1.0"},
+      {:jason, "~> 1.4"},
+      {:mint, "~> 1.7"},
+      {:mint_web_socket, "~> 1.0"},
+      {:protobuf, "~> 0.17"},
+      {:qr_code, "~> 3.2"}
     ]
   end
 end
