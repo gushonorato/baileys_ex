@@ -348,20 +348,7 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(%Node{tag: "notification"} = node, state) do
-    if NodeUtils.child(node, "link_code_companion_reg") do
-      with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
-           :ok <- persist_credentials(state.session_path, credentials),
-           {:ok, state} <-
-             track_internal_query(reply, {:pairing_finish, credentials}, %{
-               state
-               | credentials: credentials
-             }) do
-        send(state.owner, {:connection_event, {:credentials, credentials}})
-        {:ok, state}
-      end
-    else
-      {:ok, state}
-    end
+    process_and_ack(node, state, fn -> process_notification(node, state) end)
   end
 
   defp handle_node(%Node{tag: "message"} = node, state) do
@@ -399,6 +386,10 @@ defmodule BaileysExo.ConnectionProcess do
 
   defp handle_node(%Node{tag: "receipt"} = node, state), do: handle_receipt(node, state)
 
+  defp handle_node(%Node{tag: "call"} = node, state) do
+    process_and_ack(node, state, fn -> {:ok, state} end)
+  end
+
   defp handle_node(%Node{tag: "ib"} = node, state) do
     case Receiver.offline_batch_request(node) do
       {:ok, request} ->
@@ -431,6 +422,23 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(_node, state), do: {:ok, state}
+
+  defp process_notification(node, state) do
+    if NodeUtils.child(node, "link_code_companion_reg") do
+      with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
+           :ok <- persist_credentials(state.session_path, credentials),
+           {:ok, state} <-
+             track_internal_query(reply, {:pairing_finish, credentials}, %{
+               state
+               | credentials: credentials
+             }) do
+        send(state.owner, {:connection_event, {:credentials, credentials}})
+        {:ok, state}
+      end
+    else
+      {:ok, state}
+    end
+  end
 
   defp handle_ib_node(node, state) do
     case NodeUtils.child(node, "edge_routing") do
@@ -608,6 +616,28 @@ defmodule BaileysExo.ConnectionProcess do
     end
 
     send_node(Receiver.ack(node, state.credentials), state)
+  end
+
+  defp process_and_ack(node, state, process) do
+    result =
+      try do
+        process.()
+      rescue
+        error -> {:error, error}
+      catch
+        kind, reason -> {:error, {kind, reason}}
+      end
+
+    case result do
+      {:ok, updated_state} ->
+        send_node(Receiver.ack(node, updated_state.credentials), updated_state)
+
+      {:error, reason} ->
+        case send_node(Receiver.ack(node, state.credentials), state) do
+          {:ok, _state} -> {:error, reason}
+          {:error, ack_reason} -> {:error, {:ack_failed, ack_reason, reason}}
+        end
+    end
   end
 
   defp project_receipt_statuses(node, state) do
