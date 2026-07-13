@@ -162,10 +162,7 @@ defmodule BaileysExo.Client do
   def handle_call({:send_text, recipient, text, _options}, _from, %{status: :online} = state) do
     case Sender.send_text(state.connection, state.credentials, recipient, text) do
       {:ok, sent, credentials} ->
-        case FileStore.save(state.session_path, credentials) do
-          :ok -> {:reply, {:ok, sent}, %{state | credentials: credentials}}
-          {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
-        end
+        {:reply, {:ok, sent}, %{state | credentials: credentials}}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -199,14 +196,7 @@ defmodule BaileysExo.Client do
   end
 
   def handle_info({:connection_event, {:credentials, credentials}}, state) do
-    case FileStore.save(state.session_path, credentials) do
-      :ok ->
-        {:noreply, %{state | credentials: credentials}}
-
-      {:error, reason} ->
-        notify(state, {:error, %Error{message: "could not save credentials: #{inspect(reason)}"}})
-        {:noreply, state}
-    end
+    {:noreply, %{state | credentials: credentials}}
   end
 
   def handle_info({:connection_event, {:paired, me}}, state) do

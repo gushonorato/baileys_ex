@@ -74,7 +74,9 @@ defmodule BaileysExo.Messages.Receiver do
 
   def receipt_timestamp(_node, now) when is_function(now, 0), do: now.()
 
-  def ack(%Node{tag: tag, attrs: attrs}, %Credentials{me: me}, error \\ nil) when is_map(me) do
+  def ack(%Node{tag: tag, attrs: attrs}, %Credentials{} = credentials, error \\ nil) do
+    me = credentials.me || %{}
+
     %Node{
       tag: "ack",
       attrs:

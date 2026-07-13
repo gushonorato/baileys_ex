@@ -7,7 +7,7 @@ defmodule BaileysExo.Messages.Sender do
   alias BaileysExo.{ConnectionProcess, JID}
   alias BaileysExo.Protocol.USync
   alias BaileysExo.Proto.Message
-  alias BaileysExo.Signal.{SessionBuilder, SessionCipher}
+  alias BaileysExo.Signal.{SessionBuilder, SessionCipher, SessionRecord}
 
   def send_text(connection, %Credentials{me: me} = credentials, recipient, text)
       when is_map(me) and is_binary(text) and byte_size(text) > 0 do
@@ -25,14 +25,15 @@ defmodule BaileysExo.Messages.Sender do
            | lid_mappings: Map.merge(credentials.lid_mappings, mappings)
          },
          {:ok, credentials} <- ensure_sessions(connection, credentials, devices),
-         {:ok, participants, credentials} <-
-           encrypt_devices(credentials, devices, recipient, text),
+         material = retry_material(recipient, text),
+         {:ok, participants, credentials} <- encrypt_devices(credentials, devices, material),
          id = message_id(),
          :ok <- ConnectionProcess.commit_credentials(connection, credentials),
          :ok <-
            ConnectionProcess.relay(
              connection,
-             relay_stanza(id, recipient, participants, credentials.account)
+             relay_stanza(id, recipient, participants, credentials.account),
+             material
            ) do
       {:ok, %SentMessage{id: id, to: recipient, accepted_at: DateTime.utc_now()}, credentials}
     else
@@ -42,6 +43,76 @@ defmodule BaileysExo.Messages.Sender do
   end
 
   def send_text(_connection, _credentials, _recipient, _text), do: {:error, :invalid_text}
+
+  @doc false
+  def retry_material(recipient, text) when is_binary(recipient) and is_binary(text) do
+    %{recipient: recipient, text: text}
+  end
+
+  @doc false
+  def retry_stanza(
+        id,
+        %{recipient: recipient, text: text},
+        requester,
+        count,
+        %Credentials{} = credentials,
+        bundle,
+        registration_id
+      )
+      when is_binary(id) and is_binary(requester) and is_integer(count) and count > 0 do
+    with {:ok, wire_requester} <-
+           retry_requester(%{recipient: recipient, text: text}, requester, credentials),
+         address = session_address(credentials, wire_requester),
+         {:ok, record} <-
+           retry_session(
+             credentials.sessions[address],
+             bundle,
+             registration_id,
+             credentials
+           ),
+         message = text_message(text),
+         plaintext = retry_plaintext(message, recipient, requester, credentials),
+         {:ok, type, ciphertext, record} <-
+           SessionCipher.encrypt(
+             record,
+             plaintext,
+             credentials.signed_identity_key,
+             credentials.registration_id
+           ) do
+      credentials = put_in(credentials.sessions[address], record)
+
+      stanza =
+        id
+        |> relay_stanza(recipient, [{wire_requester, type, ciphertext}], credentials.account)
+        |> route_retry(recipient, wire_requester, requester, credentials)
+        |> put_retry_count(count)
+
+      {:ok, stanza, credentials}
+    end
+  end
+
+  def retry_stanza(_id, _material, _requester, _count, _credentials, _bundle, _registration_id),
+    do: {:error, :invalid_retry_material}
+
+  @doc false
+  def retry_requester(%{recipient: recipient}, requester, %Credentials{} = credentials)
+      when is_binary(recipient) and is_binary(requester) do
+    with {:ok, decoded} <- JID.decode(requester),
+         true <- valid_retry_jid?(requester, decoded),
+         wire_requester = wire_jid(credentials, requester),
+         true <-
+           own_jid?(requester, credentials.me) or
+             same_user?(requester, recipient) or
+             same_user?(wire_requester, wire_jid(credentials, recipient)) do
+      {:ok, wire_requester}
+    else
+      {:error, :invalid_jid} -> {:error, :invalid_retry_requester}
+      false -> retry_requester_error(requester, recipient, credentials)
+    end
+  end
+
+  def retry_requester(_material, _requester, _credentials),
+    do: {:error, :invalid_retry_requester}
 
   defp ensure_sessions(connection, credentials, devices) do
     missing =
@@ -77,8 +148,8 @@ defmodule BaileysExo.Messages.Sender do
     end
   end
 
-  defp encrypt_devices(credentials, devices, recipient, text) do
-    message = %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: text}}
+  defp encrypt_devices(credentials, devices, %{recipient: recipient, text: text}) do
+    message = text_message(text)
     plaintext = encode_message(message)
 
     own_plaintext =
@@ -158,17 +229,138 @@ defmodule BaileysExo.Messages.Sender do
     encoded <> :binary.copy(<<padding>>, padding)
   end
 
-  defp wire_jid(credentials, jid) do
-    {:ok, decoded} = JID.decode(jid)
-    bare = JID.encode(decoded.user, decoded.server)
+  defp retry_session(nil, nil, _registration_id, _credentials), do: {:error, :missing_session}
 
-    case Map.get(credentials.lid_mappings, bare) do
+  defp retry_session(record, nil, registration_id, _credentials) do
+    case SessionRecord.get_open_session(record) do
       nil ->
-        jid
+        {:error, :missing_session}
 
-      mapped ->
-        {:ok, mapped} = JID.decode(mapped)
-        JID.encode(mapped.user, mapped.server, decoded.device)
+      session ->
+        if is_integer(registration_id) and session.registration_id != registration_id do
+          {:error, :registration_mismatch}
+        else
+          {:ok, record}
+        end
+    end
+  end
+
+  defp retry_session(record, bundle, _registration_id, credentials) when is_map(bundle) do
+    SessionBuilder.init_outgoing(record, bundle, credentials.signed_identity_key)
+  end
+
+  defp retry_plaintext(message, recipient, requester, credentials) do
+    if own_jid?(requester, credentials.me) do
+      encode_message(%Message{
+        deviceSentMessage: %Message.DeviceSentMessage{
+          destinationJid: recipient,
+          message: message
+        }
+      })
+    else
+      encode_message(message)
+    end
+  end
+
+  defp route_retry(stanza, recipient, wire_requester, requester, credentials) do
+    attrs =
+      if own_jid?(requester, credentials.me) do
+        Map.merge(stanza.attrs, %{"to" => wire_requester, "recipient" => recipient})
+      else
+        Map.put(stanza.attrs, "to", wire_requester)
+      end
+
+    %{stanza | attrs: attrs}
+  end
+
+  defp put_retry_count(stanza, count) do
+    content =
+      Enum.map(stanza.content, fn
+        %Node{tag: "participants", content: participants} = node ->
+          participants =
+            Enum.map(participants, fn
+              %Node{tag: "to", content: [%Node{tag: "enc"} = encrypted]} = participant ->
+                encrypted = put_in(encrypted.attrs["count"], Integer.to_string(count))
+                %{participant | content: [encrypted]}
+
+              participant ->
+                participant
+            end)
+
+          %{node | content: participants}
+
+        node ->
+          node
+      end)
+
+    %{stanza | content: content}
+  end
+
+  defp text_message(text) do
+    %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: text}}
+  end
+
+  defp own_jid?(jid, me) do
+    Enum.any?([me[:id], me[:lid]], fn own ->
+      with {:ok, left} <- JID.decode(jid),
+           {:ok, right} <- JID.decode(own) do
+        left.user == right.user and left.server == right.server
+      else
+        _invalid -> false
+      end
+    end)
+  end
+
+  defp retry_requester_error(requester, recipient, credentials) do
+    case JID.decode(requester) do
+      {:ok, decoded} ->
+        cond do
+          not valid_retry_jid?(requester, decoded) -> {:error, :invalid_retry_requester}
+          own_jid?(requester, credentials.me) -> {:error, :invalid_retry_requester}
+          same_user?(requester, recipient) -> {:error, :invalid_retry_requester}
+          true -> {:error, :retry_requester_mismatch}
+        end
+
+      _invalid ->
+        {:error, :invalid_retry_requester}
+    end
+  end
+
+  defp valid_retry_jid?(jid, decoded) do
+    user_part = jid |> String.split("@", parts: 2) |> List.first()
+    malformed_device? = String.contains?(user_part, ":") and is_nil(decoded.device)
+
+    decoded.user != "" and decoded.server != "" and not malformed_device? and
+      (is_nil(decoded.device) or decoded.device > 0)
+  end
+
+  defp same_user?(left, right) do
+    with {:ok, left} <- JID.decode(left),
+         {:ok, right} <- JID.decode(right) do
+      left.user == right.user and left.server == right.server
+    else
+      _invalid -> false
+    end
+  end
+
+  defp wire_jid(credentials, jid) do
+    case JID.decode(jid) do
+      {:ok, decoded} ->
+        bare = JID.encode(decoded.user, decoded.server)
+
+        case Map.get(credentials.lid_mappings, bare) do
+          nil ->
+            jid
+
+          mapped ->
+            case JID.decode(mapped) do
+              {:ok, mapped} -> JID.encode(mapped.user, mapped.server, decoded.device)
+              {:error, :invalid_jid} -> jid
+            end
+        end
+
+      {:error, :invalid_jid} ->
+        jid
     end
   end
 

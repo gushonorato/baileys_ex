@@ -81,6 +81,49 @@ defmodule BaileysExo.Protocol.USync do
     end
   end
 
+  def parse_retry_bundle(%Node{} = receipt) do
+    case NodeUtils.child(receipt, "keys") do
+      nil ->
+        :none
+
+      %Node{} = keys ->
+        with <<5>> <- child_content(keys, "type"),
+             <<identity::binary-size(32)>> <- child_content(keys, "identity"),
+             registration when is_integer(registration) <-
+               decode_bounded_integer(child_content(receipt, "registration"), 4),
+             %Node{} = signed <- NodeUtils.child(keys, "skey"),
+             {:ok, signed_pre_key} <- parse_retry_key(signed, true),
+             {:ok, pre_key} <- parse_optional_retry_key(NodeUtils.child(keys, "key")) do
+          bundle = %{
+            registration_id: registration,
+            identity_key: wire_key(identity),
+            signed_pre_key: signed_pre_key
+          }
+
+          {:ok, if(pre_key, do: Map.put(bundle, :pre_key, pre_key), else: bundle)}
+        else
+          _invalid -> {:error, :invalid_retry_bundle}
+        end
+    end
+  end
+
+  def parse_retry_bundle(_receipt), do: {:error, :invalid_retry_bundle}
+
+  def parse_retry_registration(%Node{} = receipt) do
+    case NodeUtils.child(receipt, "registration") do
+      nil ->
+        {:ok, nil}
+
+      %Node{content: content} ->
+        case decode_bounded_integer(content, 4) do
+          registration when is_integer(registration) -> {:ok, registration}
+          nil -> {:error, :invalid_retry_registration}
+        end
+    end
+  end
+
+  def parse_retry_registration(_receipt), do: {:error, :invalid_retry_registration}
+
   defp parse_user(%Node{} = user) do
     devices_node = NodeUtils.child(user, "devices")
     device_list = devices_node && NodeUtils.child(devices_node, "device-list")
@@ -158,6 +201,20 @@ defmodule BaileysExo.Protocol.USync do
     if signed?, do: Map.put(key, :signature, child_content(node, "signature")), else: key
   end
 
+  defp parse_retry_key(node, signed?) do
+    with key_id when is_integer(key_id) <- decode_bounded_integer(child_content(node, "id"), 3),
+         <<public::binary-size(32)>> <- child_content(node, "value"),
+         signature when not signed? or is_binary(signature) <- child_content(node, "signature") do
+      key = %{key_id: key_id, public: wire_key(public)}
+      {:ok, if(signed?, do: Map.put(key, :signature, signature), else: key)}
+    else
+      _invalid -> {:error, :invalid_retry_bundle}
+    end
+  end
+
+  defp parse_optional_retry_key(nil), do: {:ok, nil}
+  defp parse_optional_retry_key(node), do: parse_retry_key(node, false)
+
   defp child_content(node, tag) do
     case NodeUtils.child(node, tag) do
       %Node{content: content} when is_binary(content) -> content
@@ -171,6 +228,13 @@ defmodule BaileysExo.Protocol.USync do
 
   defp decode_integer(nil), do: nil
   defp decode_integer(binary), do: :binary.decode_unsigned(binary, :big)
+
+  defp decode_bounded_integer(binary, max_bytes)
+       when is_binary(binary) and byte_size(binary) >= 1 and byte_size(binary) <= max_bytes do
+    :binary.decode_unsigned(binary, :big)
+  end
+
+  defp decode_bounded_integer(_binary, _max_bytes), do: nil
 
   defp integer_attr(node, key, default) do
     case Integer.parse(node.attrs[key] || "") do

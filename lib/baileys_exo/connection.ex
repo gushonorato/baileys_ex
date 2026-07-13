@@ -9,13 +9,18 @@ defmodule BaileysExo.ConnectionProcess do
   alias BaileysExo.Binary.{Codec, Node, NodeUtils}
   alias BaileysExo.{Crypto, Noise}
   alias BaileysExo.Protocol.Handshake
-  alias BaileysExo.Protocol.Pairing
+  alias BaileysExo.Protocol.{Pairing, USync}
   alias BaileysExo.Proto.Message
-  alias BaileysExo.Messages.Receiver
+  alias BaileysExo.Messages.{Receiver, Sender}
   alias BaileysExo.Signal.SessionCipher
   alias BaileysExo.Signal.PreKeys
   alias BaileysExo.Store.File, as: FileStore
   alias BaileysExo.Transport.WebSocket
+
+  @default_max_retry_count 5
+  @default_max_retry_requesters 16
+  @default_sent_message_bytes 1_048_576
+  @default_sent_message_limit 100
 
   def start_link(owner, %Credentials{} = credentials, options \\ []) do
     GenServer.start_link(__MODULE__, {owner, credentials, options})
@@ -33,12 +38,36 @@ defmodule BaileysExo.ConnectionProcess do
 
   def relay(connection, node), do: GenServer.call(connection, {:relay, node}, 30_000)
 
+  def relay(connection, node, retry_material) do
+    GenServer.call(connection, {:relay, node, retry_material}, 30_000)
+  end
+
   def commit_credentials(connection, credentials) do
     GenServer.call(connection, {:commit_credentials, credentials}, 30_000)
   end
 
   @doc false
   def dispatch(%Node{} = node, state), do: handle_node(node, state)
+
+  @impl true
+  def format_status(%{state: state} = status) when is_map(state) do
+    state =
+      state
+      |> Map.put(:sent_messages, {:redacted, map_size(Map.get(state, :sent_messages, %{}))})
+      |> redact_status_field(:pending_queries)
+      |> redact_status_field(:qr_refs)
+      |> redact_status_field(:credentials)
+      |> redact_status_field(:ephemeral_key)
+      |> redact_status_field(:noise)
+
+    status
+    |> Map.put(:state, state)
+    |> redact_status_field(:log)
+    |> redact_status_field(:message)
+    |> redact_status_field(:reason)
+  end
+
+  def format_status(status), do: status
 
   def logout(connection, jid) do
     node = %Node{
@@ -80,6 +109,17 @@ defmodule BaileysExo.ConnectionProcess do
            qr_count: 0,
            qr_timer: nil,
            keepalive_timer: nil,
+           sent_messages: %{},
+           sent_message_order: [],
+           sent_message_limit:
+             Keyword.get(options, :sent_message_limit, @default_sent_message_limit),
+           sent_message_bytes: 0,
+           sent_message_byte_limit:
+             Keyword.get(options, :sent_message_byte_limit, @default_sent_message_bytes),
+           retry_counts: %{},
+           max_retry_count: Keyword.get(options, :max_retry_count, @default_max_retry_count),
+           max_retry_requesters:
+             Keyword.get(options, :max_retry_requesters, @default_max_retry_requesters),
            session_path: Keyword.get(options, :session_path)
          }}
 
@@ -215,7 +255,18 @@ defmodule BaileysExo.ConnectionProcess do
     end
   end
 
+  def handle_call({:relay, node, retry_material}, _from, %{phase: :transport} = state) do
+    case send_node(node, state) do
+      {:ok, state} -> {:reply, :ok, remember_sent_message(state, node, retry_material)}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call({:relay, _node}, _from, state), do: {:reply, {:error, :not_connected}, state}
+
+  def handle_call({:relay, _node, _retry_material}, _from, state) do
+    {:reply, {:error, :not_connected}, state}
+  end
 
   def handle_call({:commit_credentials, credentials}, _from, state) do
     case persist_credentials(state.session_path, credentials) do
@@ -600,6 +651,14 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_receipt(node, state) do
+    if node.attrs["type"] == "retry" do
+      handle_retry_receipt(node, state)
+    else
+      handle_status_receipt(node, state)
+    end
+  end
+
+  defp handle_status_receipt(node, state) do
     projection =
       try do
         project_receipt_statuses(node, state)
@@ -616,6 +675,170 @@ defmodule BaileysExo.ConnectionProcess do
     end
 
     send_node(Receiver.ack(node, state.credentials), state)
+  end
+
+  defp handle_retry_receipt(node, state) do
+    requester = node.attrs["participant"] || node.attrs["from"] || node.attrs["to"]
+    ids = Receiver.receipt_ids(node)
+    bundle = retry_bundle(node)
+    registration = USync.parse_retry_registration(node)
+    wire_count = retry_wire_count(node)
+
+    {state, diagnostics} =
+      cond do
+        not is_binary(requester) ->
+          {state, [:invalid_retry_requester]}
+
+        ids == [] ->
+          {state, [:missing_retry_id]}
+
+        true ->
+          ids
+          |> Enum.reduce({state, [], bundle}, fn id, {state, diagnostics, bundle} ->
+            case safe_retry_message(
+                   id,
+                   requester,
+                   wire_count,
+                   bundle,
+                   registration,
+                   state
+                 ) do
+              {:ok, state, bundle_used?} ->
+                {state, diagnostics, consume_retry_bundle(bundle, bundle_used?)}
+
+              {:error, reason, state, bundle_used?} ->
+                {state, [reason | diagnostics], consume_retry_bundle(bundle, bundle_used?)}
+            end
+          end)
+          |> then(fn {state, diagnostics, _bundle} -> {state, diagnostics} end)
+      end
+
+    Enum.each(Enum.reverse(diagnostics), &emit_retry_diagnostic(state, &1))
+    send_node(Receiver.ack(node, state.credentials), state)
+  end
+
+  defp safe_retry_message(id, requester, wire_count, bundle, registration, state) do
+    retry_message(id, requester, wire_count, bundle, registration, state)
+  rescue
+    _error -> {:error, :invalid_retry_stanza, state, false}
+  catch
+    _kind, _reason -> {:error, :invalid_retry_stanza, state, false}
+  end
+
+  defp retry_message(id, requester, wire_count, bundle, registration, state) do
+    sent_messages = Map.get(state, :sent_messages, %{})
+    retry_counts = Map.get(state, :retry_counts, %{})
+    max_count = Map.get(state, :max_retry_count, @default_max_retry_count)
+
+    with {:ok, material} <- Map.fetch(sent_messages, id),
+         {:ok, normalized_requester} <-
+           Sender.retry_requester(material, requester, state.credentials) do
+      key = {id, normalized_requester}
+      count = Map.get(retry_counts, key, 0)
+
+      cond do
+        count >= max_count ->
+          {:error, :retry_limit_reached, state, false}
+
+        new_retry_requester?(retry_counts, key) and
+            retry_requester_count(retry_counts, id) >=
+              Map.get(state, :max_retry_requesters, @default_max_retry_requesters) ->
+          {:error, :retry_requester_limit_reached, state, false}
+
+        true ->
+          retry_counts = Map.put(retry_counts, key, count + 1)
+          state = Map.put(state, :retry_counts, retry_counts)
+
+          resend_message(
+            id,
+            material,
+            normalized_requester,
+            wire_count,
+            bundle,
+            registration,
+            state
+          )
+      end
+    else
+      :error -> {:error, :sent_message_not_found, state, false}
+      {:error, reason} -> {:error, reason, state, false}
+    end
+  end
+
+  defp resend_message(id, material, requester, wire_count, bundle, registration, state) do
+    with {:ok, bundle} <- bundle,
+         {:ok, registration} <- registration do
+      bundle_used? = not is_nil(bundle)
+
+      case Sender.retry_stanza(
+             id,
+             material,
+             requester,
+             wire_count,
+             state.credentials,
+             bundle,
+             registration
+           ) do
+        {:ok, stanza, credentials} ->
+          send_retry_stanza(stanza, credentials, state, bundle_used?)
+
+        {:error, reason} ->
+          {:error, reason, state, bundle_used?}
+      end
+    else
+      {:error, reason} -> {:error, reason, state, false}
+    end
+  end
+
+  defp send_retry_stanza(stanza, credentials, state, bundle_used?) do
+    candidate_state = %{state | credentials: credentials}
+
+    case persist_credentials(candidate_state.session_path, credentials) do
+      :ok ->
+        send(candidate_state.owner, {:connection_event, {:credentials, credentials}})
+
+        case send_node(stanza, candidate_state) do
+          {:ok, sent_state} -> {:ok, sent_state, bundle_used?}
+          {:error, reason} -> {:error, reason, candidate_state, bundle_used?}
+        end
+
+      {:error, reason} ->
+        {:error, {:store, reason}, state, bundle_used?}
+    end
+  end
+
+  defp retry_bundle(receipt) do
+    case USync.parse_retry_bundle(receipt) do
+      :none -> {:ok, nil}
+      {:ok, bundle} -> {:ok, bundle}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp consume_retry_bundle({:ok, bundle}, true) when not is_nil(bundle), do: {:ok, nil}
+  defp consume_retry_bundle(bundle, _used?), do: bundle
+
+  defp retry_wire_count(receipt) do
+    with %Node{} = retry <- NodeUtils.child(receipt, "retry"),
+         {count, ""} when count > 0 <- Integer.parse(retry.attrs["count"] || "") do
+      count
+    else
+      _missing_or_invalid -> 1
+    end
+  end
+
+  defp new_retry_requester?(retry_counts, key), do: not Map.has_key?(retry_counts, key)
+
+  defp retry_requester_count(retry_counts, id) do
+    Enum.count(retry_counts, fn {{message_id, _requester}, _count} -> message_id == id end)
+  end
+
+  defp emit_retry_diagnostic(state, reason) do
+    Logger.warning("retry receipt not resent", reason: reason)
+
+    if diagnostic_sender = Map.get(state, :diagnostic_sender) do
+      diagnostic_sender.({:retry_unsupported, reason})
+    end
   end
 
   defp process_and_ack(node, state, process) do
@@ -643,10 +866,6 @@ defmodule BaileysExo.ConnectionProcess do
   defp project_receipt_statuses(node, state) do
     status = Receiver.receipt_status(node.attrs["type"])
 
-    if node.attrs["type"] == "retry" do
-      Logger.warning("retry receipt ignored", reason: :outbound_material_unavailable)
-    end
-
     if status != :ignore do
       at = Receiver.receipt_timestamp(node, receipt_clock(state))
       to = node.attrs["from"] || node.attrs["to"]
@@ -658,6 +877,57 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp receipt_clock(state), do: Map.get(state, :now, &DateTime.utc_now/0)
+
+  defp remember_sent_message(state, %Node{attrs: %{"id" => id}}, retry_material)
+       when is_binary(id) and is_map(retry_material) do
+    limit = Map.get(state, :sent_message_limit, @default_sent_message_limit)
+    order = [id | Enum.reject(Map.get(state, :sent_message_order, []), &(&1 == id))]
+    order = Enum.take(order, max(limit, 0))
+
+    messages =
+      state
+      |> Map.get(:sent_messages, %{})
+      |> Map.put(id, retry_material)
+      |> Map.take(order)
+
+    byte_limit = Map.get(state, :sent_message_byte_limit, @default_sent_message_bytes)
+    {order, messages, bytes} = trim_sent_messages(order, messages, max(byte_limit, 0))
+
+    retry_counts =
+      state
+      |> Map.get(:retry_counts, %{})
+      |> Map.reject(fn {{message_id, _requester}, _count} -> message_id not in order end)
+
+    state
+    |> Map.put(:sent_messages, messages)
+    |> Map.put(:sent_message_order, order)
+    |> Map.put(:sent_message_bytes, bytes)
+    |> Map.put(:retry_counts, retry_counts)
+  end
+
+  defp remember_sent_message(state, _node, _retry_material), do: state
+
+  defp trim_sent_messages(order, messages, byte_limit) do
+    bytes =
+      Enum.reduce(messages, 0, fn {_id, material}, total -> total + material_size(material) end)
+
+    if bytes > byte_limit and order != [] do
+      oldest = List.last(order)
+      trim_sent_messages(Enum.drop(order, -1), Map.delete(messages, oldest), byte_limit)
+    else
+      {order, messages, bytes}
+    end
+  end
+
+  defp material_size(%{recipient: recipient, text: text}) do
+    byte_size(recipient) + byte_size(text)
+  end
+
+  defp material_size(_material), do: 0
+
+  defp redact_status_field(state, field) do
+    if Map.has_key?(state, field), do: Map.put(state, field, :redacted), else: state
+  end
 
   defp decrypt_signal("pkmsg", record, ciphertext, credentials) do
     SessionCipher.decrypt_pre_key(record, ciphertext, credentials)
