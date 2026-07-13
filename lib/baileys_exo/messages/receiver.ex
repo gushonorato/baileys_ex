@@ -42,6 +42,38 @@ defmodule BaileysExo.Messages.Receiver do
 
   def context(_node, _credentials), do: {:error, :invalid_message_stanza}
 
+  def receipt_ids(%Node{} = node) do
+    item_ids =
+      node
+      |> NodeUtils.children("list")
+      |> Enum.flat_map(&NodeUtils.children(&1, "item"))
+      |> Enum.map(& &1.attrs["id"])
+
+    [node.attrs["id"] | item_ids]
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+  end
+
+  def receipt_ids(_node), do: []
+
+  def receipt_status(nil), do: :delivered
+  def receipt_status("sender"), do: :sent
+  def receipt_status(type) when type in ["read", "read-self"], do: :read
+  def receipt_status("played"), do: :played
+  def receipt_status(_type), do: :ignore
+
+  def receipt_timestamp(node, now \\ &DateTime.utc_now/0)
+
+  def receipt_timestamp(%Node{attrs: attrs}, now) when is_function(now, 0) do
+    with timestamp when is_integer(timestamp) and timestamp >= 0 <- parse_integer(attrs["t"]),
+         {:ok, datetime} <- DateTime.from_unix(timestamp) do
+      datetime
+    else
+      _missing_or_invalid -> now.()
+    end
+  end
+
+  def receipt_timestamp(_node, now) when is_function(now, 0), do: now.()
+
   def ack(%Node{tag: tag, attrs: attrs}, %Credentials{me: me}, error \\ nil) when is_map(me) do
     %Node{
       tag: "ack",
@@ -49,9 +81,9 @@ defmodule BaileysExo.Messages.Receiver do
         %{
           "id" => attrs["id"],
           "to" => attrs["from"],
-          "class" => tag,
-          "from" => me[:id]
+          "class" => tag
         }
+        |> maybe_put_message_from(tag, me[:id])
         |> maybe_put("error", error)
         |> copy_attr(attrs, "participant")
         |> copy_attr(attrs, "recipient")
@@ -155,6 +187,9 @@ defmodule BaileysExo.Messages.Receiver do
   end
 
   defp same_user?(_left, _right), do: false
+
+  defp maybe_put_message_from(attrs, "message", from), do: maybe_put(attrs, "from", from)
+  defp maybe_put_message_from(attrs, _tag, _from), do: attrs
 
   defp copy_attr(target, source, key), do: maybe_put(target, key, source[key])
 

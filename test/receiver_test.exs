@@ -133,6 +133,80 @@ defmodule BaileysExo.Messages.ReceiverTest do
            }
   end
 
+  test "extracts root and batched receipt ids in wire order" do
+    receipt = %Node{
+      tag: "receipt",
+      attrs: %{"id" => "message-1"},
+      content: [
+        %Node{
+          tag: "list",
+          content: [
+            %Node{tag: "item", attrs: %{"id" => "message-2"}},
+            %Node{tag: "item", attrs: %{"id" => "message-3"}},
+            %Node{tag: "item"}
+          ]
+        }
+      ]
+    }
+
+    assert Receiver.receipt_ids(receipt) == ["message-1", "message-2", "message-3"]
+  end
+
+  test "maps receipt types without inventing delivery statuses" do
+    assert Receiver.receipt_status(nil) == :delivered
+    assert Receiver.receipt_status("sender") == :sent
+    assert Receiver.receipt_status("read") == :read
+    assert Receiver.receipt_status("read-self") == :read
+    assert Receiver.receipt_status("played") == :played
+
+    for type <- ["retry", "inactive", "hist_sync", "peer_msg", "future-type"] do
+      assert Receiver.receipt_status(type) == :ignore
+    end
+  end
+
+  test "uses a valid receipt timestamp" do
+    receipt = %Node{tag: "receipt", attrs: %{"t" => "1700000000"}}
+    fallback = fn -> ~U[2000-01-01 00:00:00Z] end
+
+    assert Receiver.receipt_timestamp(receipt, fallback) == ~U[2023-11-14 22:13:20Z]
+  end
+
+  test "uses an injected clock for missing or malformed receipt timestamps" do
+    fallback = fn -> ~U[2000-01-01 00:00:00Z] end
+
+    assert Receiver.receipt_timestamp(%Node{tag: "receipt"}, fallback) == fallback.()
+
+    assert Receiver.receipt_timestamp(
+             %Node{tag: "receipt", attrs: %{"t" => "not-a-timestamp"}},
+             fallback
+           ) == fallback.()
+  end
+
+  test "builds a generic ack without a local message sender", %{credentials: credentials} do
+    notification = %Node{
+      tag: "notification",
+      attrs: %{
+        "id" => "notification-1",
+        "from" => "s.whatsapp.net",
+        "participant" => "5521888888888@s.whatsapp.net",
+        "recipient" => "5511000000000@s.whatsapp.net",
+        "type" => "devices"
+      }
+    }
+
+    assert Receiver.ack(notification, credentials) == %Node{
+             tag: "ack",
+             attrs: %{
+               "class" => "notification",
+               "id" => "notification-1",
+               "participant" => "5521888888888@s.whatsapp.net",
+               "recipient" => "5511000000000@s.whatsapp.net",
+               "to" => "s.whatsapp.net",
+               "type" => "devices"
+             }
+           }
+  end
+
   test "extracts text from nested future-proof message wrappers" do
     text = %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: "recebida"}}
 
