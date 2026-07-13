@@ -7,6 +7,7 @@ defmodule BaileysExo.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
       deps: deps()
     ]
   end
@@ -28,6 +29,16 @@ defmodule BaileysExo.MixProject do
       {:mint_web_socket, "~> 1.0"},
       {:protobuf, "~> 0.17"},
       {:qr_code, "~> 3.2"}
+    ]
+  end
+
+  defp aliases do
+    [
+      "proto.generate": "cmd scripts/generate_protobuf.sh",
+      "proto.check": [
+        "proto.generate",
+        "cmd git diff --exit-code -- proto lib/baileys_exo/proto/generated"
+      ]
     ]
   end
 end

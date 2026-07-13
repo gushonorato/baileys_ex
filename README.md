@@ -201,7 +201,8 @@ The implementation includes:
 - Mint WebSocket over OTP TLS.
 - Noise XX with X25519, AES-256-GCM and SHA-256.
 - WhatsApp BinaryNode codec and complete token dictionaries.
-- Minimal generated WhatsApp protobuf schema.
+- Full generated WhatsApp message and protocol protobuf schema, pinned to a
+  documented Baileys revision.
 - XEd25519 signatures implemented in Elixir.
 - Signal X3DH and Double Ratchet for direct messages.
 - USync device/LID discovery and multi-device fanout.

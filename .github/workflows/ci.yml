@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.0"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "32.0"
+
+      - run: mix deps.get
+      - run: mix proto.check
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix test --warnings-as-errors
+      - run: git diff --check
