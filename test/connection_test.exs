@@ -5,9 +5,10 @@ defmodule BaileysExo.ConnectionProcessTest do
   alias BaileysExo.Binary.{Node, NodeUtils}
   alias BaileysExo.Client
   alias BaileysExo.ConnectionProcess
+  alias BaileysExo.Crypto.XEdDSA
   alias BaileysExo.Messages.Sender
   alias BaileysExo.Proto.Message
-  alias BaileysExo.Signal.SessionCipher
+  alias BaileysExo.Signal.{SessionBuilder, SessionCipher}
   alias BaileysExo.{Crypto, Protocol.Pairing}
 
   setup do
@@ -183,13 +184,13 @@ defmodule BaileysExo.ConnectionProcessTest do
   test "finishes pairing-code registration and acknowledges its notification once", %{
     state: state
   } do
-    credentials = Credentials.new()
+    credentials = deterministic_credentials(70)
 
     assert {:ok, code, _request, credentials} =
              Pairing.request_code(credentials, "+55 11 99999-9999", "ABCD1234")
 
-    primary_ephemeral = Crypto.generate_x25519_key_pair()
-    primary_identity = Crypto.generate_x25519_key_pair()
+    primary_ephemeral = deterministic_key_pair(74)
+    primary_identity = deterministic_key_pair(75)
     salt = :binary.copy(<<1>>, 32)
     iv = :binary.copy(<<2>>, 16)
     key = Crypto.pbkdf2_sha256(code, salt, 131_072, 32)
@@ -426,7 +427,7 @@ defmodule BaileysExo.ConnectionProcessTest do
     state =
       Map.merge(state, %{
         credentials: %{
-          Credentials.new()
+          deterministic_credentials(30)
           | me: %{id: "5511000000000:2@s.whatsapp.net", lid: "123456789:2@lid"}
         },
         session_path: nil,
@@ -597,7 +598,7 @@ defmodule BaileysExo.ConnectionProcessTest do
   end
 
   test "applies persisted credential events without writing stale snapshots again" do
-    old_credentials = Credentials.new()
+    old_credentials = deterministic_credentials(40)
     new_credentials = %{old_credentials | next_pre_key_id: 42}
 
     state = %{
@@ -612,14 +613,80 @@ defmodule BaileysExo.ConnectionProcessTest do
     assert updated_state.credentials == new_credentials
   end
 
+  test "injected node transport records an inbound message receipt independently of projection",
+       %{
+         state: state
+       } do
+    local = %{deterministic_credentials(50) | me: %{id: "5511000000000:2@s.whatsapp.net"}}
+    local_pre_key = deterministic_key_pair(59)
+    local = %{local | pre_keys: %{7 => local_pre_key}}
+    remote = deterministic_credentials(60)
+
+    bundle = %{
+      registration_id: local.registration_id,
+      identity_key: <<5, local.signed_identity_key.public::binary>>,
+      signed_pre_key: %{
+        key_id: local.signed_pre_key.key_id,
+        public: <<5, local.signed_pre_key.key_pair.public::binary>>,
+        signature: local.signed_pre_key.signature
+      },
+      pre_key: %{key_id: 7, public: <<5, local_pre_key.public::binary>>}
+    }
+
+    assert {:ok, remote_record} =
+             SessionBuilder.init_outgoing(nil, bundle, remote.signed_identity_key)
+
+    plaintext =
+      %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: "injected transport"}}
+      |> Protobuf.encode()
+      |> Kernel.<>(<<1>>)
+
+    assert {:ok, :pkmsg, ciphertext, _remote_record} =
+             SessionCipher.encrypt(
+               remote_record,
+               plaintext,
+               remote.signed_identity_key,
+               remote.registration_id
+             )
+
+    message = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "incoming-integration-1",
+        "from" => "5521999999999@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "enc", attrs: %{"type" => "pkmsg"}, content: ciphertext}]
+    }
+
+    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
+
+    assert_receive {:sent_node,
+                    %Node{
+                      tag: "receipt",
+                      attrs: %{
+                        "id" => "incoming-integration-1",
+                        "to" => "5521999999999@s.whatsapp.net"
+                      }
+                    }}
+
+    assert_receive {:connection_event,
+                    {:text_message,
+                     %{
+                       id: "incoming-integration-1",
+                       chat_jid: "5521999999999@s.whatsapp.net"
+                     }, "injected transport"}}
+  end
+
   defp retry_state(state, max_retry_count) do
     local = %{
-      Credentials.new()
+      deterministic_credentials(10)
       | me: %{id: "5511000000000:2@s.whatsapp.net", lid: "123456789:2@lid"}
     }
 
-    remote = Credentials.new()
-    remote_pre_key = Crypto.generate_x25519_key_pair()
+    remote = deterministic_credentials(20)
+    remote_pre_key = deterministic_key_pair(29)
     remote = %{remote | pre_keys: %{7 => remote_pre_key}}
     requester = "5521999999999:3@s.whatsapp.net"
 
@@ -689,5 +756,29 @@ defmodule BaileysExo.ConnectionProcessTest do
     padding = :binary.last(padded)
     decoded = padded |> binary_part(0, byte_size(padded) - padding) |> Message.decode()
     decoded.extendedTextMessage.text
+  end
+
+  defp deterministic_credentials(seed) do
+    identity = deterministic_key_pair(seed)
+    signed_key = deterministic_key_pair(seed + 1)
+
+    %Credentials{
+      noise_key: deterministic_key_pair(seed + 2),
+      pairing_ephemeral_key: deterministic_key_pair(seed + 3),
+      signed_identity_key: identity,
+      signed_pre_key: %{
+        key_pair: signed_key,
+        key_id: 1,
+        signature: XEdDSA.sign(<<5, signed_key.public::binary>>, identity.private)
+      },
+      registration_id: seed,
+      adv_secret_key: :binary.copy(<<seed>>, 32)
+    }
+  end
+
+  defp deterministic_key_pair(seed) do
+    private = :binary.copy(<<seed>>, 32)
+    {public, ^private} = :crypto.generate_key(:ecdh, :x25519, private)
+    %{public: public, private: private}
   end
 end

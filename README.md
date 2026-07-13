@@ -108,6 +108,37 @@ bundles, advances one Signal ratchet per device, synchronizes other linked
 devices and relays the encrypted stanza. Delivery and read state arrive as
 separate `:message_status` events.
 
+`%Baileys.MessageStatus{}` has the following wire semantics:
+
+| Incoming stanza | `status` | Public event |
+| --- | --- | --- |
+| Successful server `<ack class="message">` | none | no |
+| Failed server `<ack class="message" error="...">` | `:failed` | yes |
+| Receipt without `type` | `:delivered` | yes |
+| Receipt `type="sender"` | `:sent` | yes |
+| Receipt `type="read"` or `type="read-self"` | `:read` | yes |
+| Receipt `type="played"` | `:played` | yes |
+| Receipt `type="retry"` | none | no |
+| Receipt `type="inactive"`, `hist_sync` or `peer_msg` | none | no |
+| Unknown receipt type | none | no |
+
+A successful server ACK only confirms stanza acceptance. It is not a delivery
+confirmation and is intentionally silent. `:sent` comes from a sender receipt.
+`MessageStatus.at` uses the receipt or failed-ACK Unix timestamp when valid and
+falls back to local processing time only when that timestamp is absent or
+invalid. Batched receipts produce one status event per message ID. For
+`:failed`, `error` contains the server ACK attributes; it is `nil` for receipt
+statuses.
+
+Retry receipts are ACKed and never projected as delivery. The client keeps at
+most 100 recent text payloads (and 1 MiB total) in connection memory, permits at
+most five attempts per message/requesting device and limits requester
+cardinality. Valid retries retain the logical message ID and re-encrypt for the
+requesting device. Retry payloads and counters are not persisted, so pending
+retry support is lost on disconnect or process restart. Missing material,
+invalid bundles and exhausted limits are internal diagnostics, not delivery
+events.
+
 The complete example persists a `hello_world` session, waits for pairing and
 sends `Hello world`:
 
@@ -147,6 +178,9 @@ messages arrive should use a terminal UI/readline library.
 
 Only direct text messages are in scope. Groups, media, newsletters, calls,
 reactions and history synchronization are intentionally not exposed.
+Incoming calls and unsupported notifications are still acknowledged at the
+protocol layer so they do not remain pending. Their contents are intentionally
+discarded and no public call, group or notification event is emitted.
 
 ## Lifecycle
 
@@ -179,4 +213,5 @@ The implementation includes:
 mix format --check-formatted
 mix compile --warnings-as-errors
 mix test --warnings-as-errors
+git diff --check
 ```

@@ -52,9 +52,15 @@ defmodule Baileys.SentMessage do
 end
 
 defmodule Baileys.MessageStatus do
-  @moduledoc "Delivery status update for an outgoing message."
+  @moduledoc """
+  Receipt-derived status for an outgoing message, or a failed server ACK.
 
-  @type status :: :failed | :pending | :sent | :delivered | :read | :played | :unknown
+  Successful server ACKs are silent. The timestamp comes from the stanza when
+  valid and otherwise uses local processing time. Failed statuses retain the
+  server ACK attributes in `error`.
+  """
+
+  @type status :: :failed | :sent | :delivered | :read | :played
   @type t :: %__MODULE__{
           id: String.t(),
           to: String.t(),
