@@ -229,10 +229,10 @@ defmodule BaileysExo.Client do
     {:noreply, state}
   end
 
-  def handle_info({:connection_event, {:message_status, id, to, status, error}}, state) do
+  def handle_info({:connection_event, {:message_status, id, to, status, at, error}}, state) do
     notify(state, {
       :message_status,
-      %MessageStatus{id: id, to: to, status: status, at: DateTime.utc_now(), error: error}
+      %MessageStatus{id: id, to: to, status: status, at: at, error: error}
     })
 
     {:noreply, state}

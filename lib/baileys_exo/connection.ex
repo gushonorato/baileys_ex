@@ -3,6 +3,8 @@ defmodule BaileysExo.ConnectionProcess do
 
   use GenServer
 
+  require Logger
+
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.{Codec, Node, NodeUtils}
   alias BaileysExo.{Crypto, Noise}
@@ -34,6 +36,9 @@ defmodule BaileysExo.ConnectionProcess do
   def commit_credentials(connection, credentials) do
     GenServer.call(connection, {:commit_credentials, credentials}, 30_000)
   end
+
+  @doc false
+  def dispatch(%Node{} = node, state), do: handle_node(node, state)
 
   def logout(connection, jid) do
     node = %Node{
@@ -381,32 +386,18 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp handle_node(%Node{tag: "ack", attrs: %{"class" => "message", "id" => id}} = node, state) do
-    status = if node.attrs["error"], do: :failed, else: :sent
-
-    send(state.owner, {
-      :connection_event,
-      {:message_status, id, node.attrs["from"] || node.attrs["to"], status,
-       if(status == :failed, do: node.attrs)}
-    })
-
-    {:ok, state}
-  end
-
-  defp handle_node(%Node{tag: "receipt", attrs: %{"id" => id}} = node, state) do
-    status =
-      case node.attrs["type"] do
-        "read" -> :read
-        "played" -> :played
-        _type -> :delivered
-      end
-
-    send(state.owner, {
-      :connection_event,
-      {:message_status, id, node.attrs["from"] || node.attrs["to"], status, nil}
-    })
+    if node.attrs["error"] do
+      send(state.owner, {
+        :connection_event,
+        {:message_status, id, node.attrs["from"] || node.attrs["to"], :failed,
+         Receiver.receipt_timestamp(node, receipt_clock(state)), node.attrs}
+      })
+    end
 
     {:ok, state}
   end
+
+  defp handle_node(%Node{tag: "receipt"} = node, state), do: handle_receipt(node, state)
 
   defp handle_node(%Node{tag: "ib"} = node, state) do
     case Receiver.offline_batch_request(node) do
@@ -478,6 +469,13 @@ defmodule BaileysExo.ConnectionProcess do
     else
       send(state.owner, {:connection_event, {:connection, :online}})
       {:ok, schedule_keepalive(state)}
+    end
+  end
+
+  defp send_node(node, %{node_sender: node_sender} = state) when is_function(node_sender, 1) do
+    case node_sender.(node) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -592,6 +590,44 @@ defmodule BaileysExo.ConnectionProcess do
       {:ok, state}
     end
   end
+
+  defp handle_receipt(node, state) do
+    projection =
+      try do
+        project_receipt_statuses(node, state)
+        :ok
+      rescue
+        error -> {:error, error}
+      catch
+        kind, reason -> {:error, {kind, reason}}
+      end
+
+    if match?({:error, _reason}, projection) do
+      {:error, reason} = projection
+      send(state.owner, {:connection_event, {:error, {:receipt_projection_failed, reason}}})
+    end
+
+    send_node(Receiver.ack(node, state.credentials), state)
+  end
+
+  defp project_receipt_statuses(node, state) do
+    status = Receiver.receipt_status(node.attrs["type"])
+
+    if node.attrs["type"] == "retry" do
+      Logger.warning("retry receipt ignored", reason: :outbound_material_unavailable)
+    end
+
+    if status != :ignore do
+      at = Receiver.receipt_timestamp(node, receipt_clock(state))
+      to = node.attrs["from"] || node.attrs["to"]
+
+      Enum.each(Receiver.receipt_ids(node), fn id ->
+        send(state.owner, {:connection_event, {:message_status, id, to, status, at, nil}})
+      end)
+    end
+  end
+
+  defp receipt_clock(state), do: Map.get(state, :now, &DateTime.utc_now/0)
 
   defp decrypt_signal("pkmsg", record, ciphertext, credentials) do
     SessionCipher.decrypt_pre_key(record, ciphertext, credentials)
