@@ -11,14 +11,16 @@ defmodule BaileysExo.ConnectionProcess do
   alias BaileysExo.Protocol.Handshake
   alias BaileysExo.Protocol.{Pairing, USync}
   alias BaileysExo.Proto.Message
-  alias BaileysExo.Messages.{Receiver, Sender}
-  alias BaileysExo.Signal.SessionCipher
+  alias BaileysExo.Messages.{GroupNotification, Receiver, Sender}
+  alias BaileysExo.Signal.{SenderKey, SessionCipher}
   alias BaileysExo.Signal.PreKeys
   alias BaileysExo.Store.File, as: FileStore
   alias BaileysExo.Transport.WebSocket
 
   @default_max_retry_count 5
   @default_max_retry_requesters 16
+  @default_incoming_retry_budget 100
+  @default_max_persisted_pre_keys PreKeys.initial_count() + @default_incoming_retry_budget
   @default_sent_message_bytes 1_048_576
   @default_sent_message_limit 100
 
@@ -118,6 +120,13 @@ defmodule BaileysExo.ConnectionProcess do
              Keyword.get(options, :sent_message_byte_limit, @default_sent_message_bytes),
            retry_counts: %{},
            max_retry_count: Keyword.get(options, :max_retry_count, @default_max_retry_count),
+           incoming_retry_counts: %{},
+           incoming_retry_order: [],
+           incoming_retry_total: 0,
+           incoming_retry_limit:
+             Keyword.get(options, :incoming_retry_limit, @default_sent_message_limit),
+           incoming_retry_budget:
+             Keyword.get(options, :incoming_retry_budget, @default_incoming_retry_budget),
            max_retry_requesters:
              Keyword.get(options, :max_retry_requesters, @default_max_retry_requesters),
            session_path: Keyword.get(options, :session_path)
@@ -406,6 +415,8 @@ defmodule BaileysExo.ConnectionProcess do
     if NodeUtils.child(node, "enc") do
       case decrypt_message(node, state.credentials) do
         {:ok, envelope, credentials, protocol_response} ->
+          state = clear_incoming_retry(node, state)
+
           with {:ok, state} <- acknowledge_message(credentials, protocol_response, state) do
             upsert_type = if envelope.offline, do: :append, else: :notify
 
@@ -430,9 +441,11 @@ defmodule BaileysExo.ConnectionProcess do
             {:ok, state}
           end
 
+        {:error, reason, credentials} ->
+          handle_message_decrypt_failure(node, reason, credentials, state)
+
         {:error, reason} ->
-          send(state.owner, {:connection_event, {:error, {:message_decrypt_failed, reason}}})
-          send_node(Receiver.failure_ack(node, state.credentials), state)
+          handle_message_decrypt_failure(node, reason, state.credentials, state)
       end
     else
       send_node(Receiver.ack(node, state.credentials), state)
@@ -504,19 +517,36 @@ defmodule BaileysExo.ConnectionProcess do
   defp handle_node(_node, state), do: {:ok, state}
 
   defp process_notification(node, state) do
-    if NodeUtils.child(node, "link_code_companion_reg") do
-      with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
-           :ok <- persist_credentials(state.session_path, credentials),
-           {:ok, state} <-
-             track_internal_query(reply, {:pairing_finish, credentials}, %{
-               state
-               | credentials: credentials
-             }) do
-        send(state.owner, {:connection_event, {:credentials, credentials}})
+    cond do
+      node.attrs["type"] == "w:gp2" ->
+        case GroupNotification.decode(node, state.credentials) do
+          {:ok, envelope, effect} ->
+            send(state.owner, {
+              :connection_event,
+              {:messages_upsert, [envelope], :append, nil}
+            })
+
+            send(state.owner, {:connection_event, {:group_effect, effect}})
+            {:ok, state}
+
+          {:error, _reason} ->
+            {:ok, state}
+        end
+
+      NodeUtils.child(node, "link_code_companion_reg") ->
+        with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
+             :ok <- persist_credentials(state.session_path, credentials),
+             {:ok, state} <-
+               track_internal_query(reply, {:pairing_finish, credentials}, %{
+                 state
+                 | credentials: credentials
+               }) do
+          send(state.owner, {:connection_event, {:credentials, credentials}})
+          {:ok, state}
+        end
+
+      true ->
         {:ok, state}
-      end
-    else
-      {:ok, state}
     end
   end
 
@@ -622,17 +652,114 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp decrypt_message(node, credentials) do
-    encrypted = NodeUtils.child(node, "enc")
-
     with {:ok, context} <- Receiver.context(node, credentials),
-         %Node{content: ciphertext} <- encrypted,
-         true <- is_binary(ciphertext),
-         address <- normalize_signal_address(context.signal_jid),
-         record <- credentials.sessions[address],
-         {:ok, plaintext, record, used_pre_key} <-
-           decrypt_signal(encrypted.attrs["type"], record, ciphertext, credentials),
+         encrypted when encrypted != [] <- ordered_encrypted_payloads(node),
+         {:ok, message, raw_content, credentials} <-
+           decrypt_payloads(encrypted, context, credentials) do
+      envelope = Receiver.envelope(context, message, raw_content)
+      {:ok, envelope, credentials, context.protocol_response}
+    else
+      [] -> {:error, :missing_encrypted_message}
+      {:error, _reason} = error -> error
+      {:error, _reason, _credentials} = error -> error
+      _invalid -> {:error, :unsupported_message}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp ordered_encrypted_payloads(node) do
+    node
+    |> NodeUtils.children("enc")
+    |> Enum.sort_by(&if(&1.attrs["type"] == "skmsg", do: 1, else: 0))
+  end
+
+  defp decrypt_payloads(encrypted, context, credentials) do
+    encrypted
+    |> Enum.reduce(
+      {nil, nil, credentials, []},
+      fn encrypted, {message, raw_content, credentials, errors} ->
+        case decrypt_encrypted_payload(encrypted, context, credentials) do
+          {:ok, decoded, unpadded, credentials} ->
+            {merge_messages(message, decoded), unpadded, credentials, errors}
+
+          {:error, reason} ->
+            {message, raw_content, credentials, [{encrypted.attrs["type"], reason} | errors]}
+        end
+      end
+    )
+    |> case do
+      {message, raw_content, credentials, errors} ->
+        finish_decrypted_payloads(message, raw_content, credentials, errors)
+    end
+  end
+
+  defp finish_decrypted_payloads(message, raw_content, credentials, errors) do
+    case Enum.find(errors, fn {type, _reason} -> type == "skmsg" end) do
+      {_type, reason} ->
+        {:error, reason, credentials}
+
+      nil when is_struct(message, Message) and is_binary(raw_content) ->
+        {:ok, message, raw_content, credentials}
+
+      nil when errors != [] ->
+        {_type, reason} = hd(errors)
+        {:error, reason, credentials}
+
+      nil ->
+        {:error, :invalid_encrypted_message, credentials}
+    end
+  end
+
+  defp decrypt_encrypted_payload(%Node{content: ciphertext, attrs: attrs}, context, credentials)
+       when is_binary(ciphertext) do
+    with {:ok, plaintext, credentials} <-
+           decrypt_payload(attrs["type"], context, ciphertext, credentials),
          {:ok, unpadded} <- unpad_message(plaintext),
-         message <- Message.decode(unpadded) do
+         message <- Message.decode(unpadded),
+         {:ok, credentials} <- process_sender_key_distribution(message, context, credentials) do
+      {:ok, message, unpadded, credentials}
+    else
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :unsupported_message}
+    end
+  rescue
+    error -> {:error, error}
+  end
+
+  defp decrypt_encrypted_payload(_encrypted, _context, _credentials),
+    do: {:error, :invalid_encrypted_message}
+
+  defp merge_messages(nil, %Message{} = message), do: message
+
+  defp merge_messages(%Message{} = current, %Message{} = incoming) do
+    incoming
+    |> Map.from_struct()
+    |> Enum.reduce(current, fn
+      {_field, nil}, message -> message
+      {_field, []}, message -> message
+      {field, value}, message -> Map.put(message, field, value)
+    end)
+  end
+
+  defp decrypt_payload("skmsg", context, ciphertext, credentials) do
+    key = SenderKey.record_key(context.wire_chat_jid, context.wire_sender_jid)
+
+    with {:ok, record} <- Map.fetch(credentials.sender_keys, key),
+         {:ok, plaintext, record} <- SenderKey.decrypt(record, ciphertext) do
+      {:ok, plaintext, put_in(credentials.sender_keys[key], record)}
+    else
+      :error -> {:error, :missing_sender_key}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp decrypt_payload(type, context, ciphertext, credentials) do
+    address = normalize_signal_address(context.signal_jid)
+    record = credentials.sessions[address]
+
+    with {:ok, plaintext, record, used_pre_key} <-
+           decrypt_signal(type, record, ciphertext, credentials) do
       credentials = put_in(credentials.sessions[address], record)
 
       credentials =
@@ -640,17 +767,161 @@ defmodule BaileysExo.ConnectionProcess do
           do: %{credentials | pre_keys: Map.delete(credentials.pre_keys, used_pre_key)},
           else: credentials
 
-      envelope = Receiver.envelope(context, message, unpadded)
-      {:ok, envelope, credentials, context.protocol_response}
-    else
-      nil -> {:error, :missing_encrypted_message}
-      false -> {:error, :invalid_encrypted_message}
-      {:error, _reason} = error -> error
-      _invalid -> {:error, :unsupported_message}
+      {:ok, plaintext, credentials}
     end
-  rescue
-    error -> {:error, error}
   end
+
+  defp process_sender_key_distribution(message, context, credentials) do
+    message = (message.deviceSentMessage && message.deviceSentMessage.message) || message
+
+    case message.senderKeyDistributionMessage do
+      %Message.SenderKeyDistributionMessage{
+        groupId: group_id,
+        axolotlSenderKeyDistributionMessage: distribution
+      }
+      when is_binary(group_id) and group_id != "" and is_binary(distribution) ->
+        key = SenderKey.record_key(group_id, context.wire_sender_jid)
+
+        case SenderKey.process_distribution(credentials.sender_keys[key], distribution) do
+          {:ok, record} -> {:ok, put_in(credentials.sender_keys[key], record)}
+          {:error, _reason} = error -> error
+        end
+
+      _missing ->
+        {:ok, credentials}
+    end
+  end
+
+  defp handle_message_decrypt_failure(node, reason, credentials, state) do
+    key = {node.attrs["id"], node.attrs["participant"] || node.attrs["from"]}
+    {count, retry?, state} = track_incoming_retry(key, state)
+    {retry, credentials} = incoming_retry_receipt(node, count, retry?, credentials)
+    state = %{state | credentials: credentials}
+
+    send(state.owner, {
+      :connection_event,
+      {:error, {:message_decrypt_failed, %{reason: reason, attempt: count, retry?: retry?}}}
+    })
+
+    with :ok <- persist_credentials(Map.get(state, :session_path), credentials),
+         {:ok, state} <- maybe_send_retry(retry, state),
+         {:ok, state} <- send_node(Receiver.failure_ack(node, credentials), state) do
+      send(state.owner, {:connection_event, {:credentials, credentials}})
+      {:ok, state}
+    end
+  end
+
+  defp track_incoming_retry(key, state) do
+    counts = Map.get(state, :incoming_retry_counts, %{})
+    previous = Map.get(counts, key, 0)
+    max_retry_count = Map.get(state, :max_retry_count, @default_max_retry_count)
+    total = Map.get(state, :incoming_retry_total, 0)
+    budget = Map.get(state, :incoming_retry_budget, @default_incoming_retry_budget)
+
+    if previous >= max_retry_count or total >= budget do
+      {previous, false, state}
+    else
+      count = previous + 1
+      order = Map.get(state, :incoming_retry_order, [])
+      order = if previous == 0, do: order ++ [key], else: order
+      counts = Map.put(counts, key, count)
+      {counts, order} = trim_incoming_retries(counts, order, state)
+
+      state =
+        state
+        |> Map.put(:incoming_retry_counts, counts)
+        |> Map.put(:incoming_retry_order, order)
+        |> Map.put(:incoming_retry_total, total + 1)
+
+      {count, true, state}
+    end
+  end
+
+  defp trim_incoming_retries(counts, order, state) do
+    limit = Map.get(state, :incoming_retry_limit, @default_sent_message_limit)
+    overflow = max(length(order) - limit, 0)
+    {expired, order} = Enum.split(order, overflow)
+    {Map.drop(counts, expired), order}
+  end
+
+  defp clear_incoming_retry(node, state) do
+    key = {node.attrs["id"], node.attrs["participant"] || node.attrs["from"]}
+    counts = Map.delete(Map.get(state, :incoming_retry_counts, %{}), key)
+    order = List.delete(Map.get(state, :incoming_retry_order, []), key)
+
+    state
+    |> Map.put(:incoming_retry_counts, counts)
+    |> Map.put(:incoming_retry_order, order)
+  end
+
+  defp incoming_retry_receipt(_node, _count, false, credentials), do: {nil, credentials}
+
+  defp incoming_retry_receipt(node, count, true, credentials) do
+    attrs =
+      %{"id" => node.attrs["id"], "type" => "retry", "to" => node.attrs["from"]}
+      |> copy_node_attr(node.attrs, "recipient")
+      |> copy_node_attr(node.attrs, "participant")
+
+    content = [
+      %Node{
+        tag: "retry",
+        attrs: %{
+          "count" => Integer.to_string(count),
+          "error" => "0",
+          "id" => node.attrs["id"],
+          "t" => node.attrs["t"],
+          "v" => "1"
+        }
+      },
+      %Node{tag: "registration", content: encode_retry_integer(credentials.registration_id, 4)}
+    ]
+
+    {content, credentials} = maybe_add_retry_keys(content, credentials, count)
+    {%Node{tag: "receipt", attrs: attrs, content: content}, credentials}
+  end
+
+  defp maybe_add_retry_keys(content, credentials, count) when count <= 1,
+    do: {content, credentials}
+
+  defp maybe_add_retry_keys(content, credentials, _count) do
+    if map_size(credentials.pre_keys) >= @default_max_persisted_pre_keys do
+      {content, credentials}
+    else
+      {credentials, upload, last_id} = PreKeys.upload_node(credentials, 1)
+      credentials = %{credentials | first_unuploaded_pre_key_id: last_id + 1}
+      list = NodeUtils.child(upload, "list")
+
+      key_content = [
+        NodeUtils.child(upload, "type"),
+        NodeUtils.child(upload, "identity"),
+        NodeUtils.child(list, "key"),
+        NodeUtils.child(upload, "skey")
+      ]
+
+      key_content =
+        if credentials.account do
+          key_content ++
+            [%Node{tag: "device-identity", content: Protobuf.encode(credentials.account)}]
+        else
+          key_content
+        end
+
+      {content ++ [%Node{tag: "keys", content: key_content}], credentials}
+    end
+  end
+
+  defp maybe_send_retry(nil, state), do: {:ok, state}
+  defp maybe_send_retry(retry, state), do: send_node(retry, state)
+
+  defp copy_node_attr(attrs, source, key) do
+    case source[key] do
+      nil -> attrs
+      value -> Map.put(attrs, key, value)
+    end
+  end
+
+  defp encode_retry_integer(value, bytes),
+    do: <<value::unsigned-big-integer-size(bytes)-unit(8)>>
 
   defp acknowledge_message(credentials, protocol_response, state) do
     with :ok <- persist_credentials(state.session_path, credentials),

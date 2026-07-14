@@ -2,9 +2,10 @@ defmodule BaileysExo.Store.JSONCodec do
   @moduledoc false
 
   alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Proto.ADVSignedDeviceIdentity
+  alias BaileysExo.Proto.{ADVSignedDeviceIdentity, SenderKeyRecordStructure}
+  alias BaileysExo.Signal.SenderKey
 
-  @version 1
+  @version 2
 
   def encode(%Credentials{} = credentials) do
     Jason.encode(%{
@@ -17,9 +18,9 @@ defmodule BaileysExo.Store.JSONCodec do
 
   def decode(encoded) when is_binary(encoded) do
     with {:ok, document} <- Jason.decode(encoded),
-         :ok <- validate_version(document),
+         {:ok, version} <- validate_version(document),
          %{"credentials" => credentials} <- document,
-         {:ok, credentials} <- decode_credentials(credentials) do
+         {:ok, credentials} <- decode_credentials(credentials, version) do
       {:ok, credentials}
     else
       {:error, :unsupported_session_version} = error -> error
@@ -29,7 +30,7 @@ defmodule BaileysExo.Store.JSONCodec do
     _error -> {:error, :invalid_credentials}
   end
 
-  defp validate_version(%{"version" => @version}), do: :ok
+  defp validate_version(%{"version" => version}) when version in [1, @version], do: {:ok, version}
   defp validate_version(%{"version" => _version}), do: {:error, :unsupported_session_version}
   defp validate_version(_document), do: {:error, :invalid_credentials}
 
@@ -50,12 +51,13 @@ defmodule BaileysExo.Store.JSONCodec do
       "next_pre_key_id" => credentials.next_pre_key_id,
       "first_unuploaded_pre_key_id" => credentials.first_unuploaded_pre_key_id,
       "sessions" => Map.new(credentials.sessions, &encode_session_record_entry/1),
+      "sender_keys" => Map.new(credentials.sender_keys, &encode_sender_key_entry/1),
       "pre_keys" => Map.new(credentials.pre_keys, &encode_pre_key_entry/1),
       "lid_mappings" => credentials.lid_mappings
     }
   end
 
-  defp decode_credentials(value) when is_map(value) do
+  defp decode_credentials(value, version) when is_map(value) do
     with {:ok, noise_key} <- decode_key_pair(value["noise_key"]),
          {:ok, pairing_ephemeral_key} <- decode_key_pair(value["pairing_ephemeral_key"]),
          {:ok, signed_identity_key} <- decode_key_pair(value["signed_identity_key"]),
@@ -72,6 +74,7 @@ defmodule BaileysExo.Store.JSONCodec do
          {:ok, first_unuploaded_pre_key_id} <-
            decode_non_negative_integer(value["first_unuploaded_pre_key_id"]),
          {:ok, sessions} <- decode_sessions(value["sessions"]),
+         {:ok, sender_keys} <- decode_sender_keys(value, version),
          {:ok, pre_keys} <- decode_pre_keys(value["pre_keys"]),
          {:ok, lid_mappings} <- decode_string_map(value["lid_mappings"]) do
       {:ok,
@@ -91,13 +94,35 @@ defmodule BaileysExo.Store.JSONCodec do
          next_pre_key_id: next_pre_key_id,
          first_unuploaded_pre_key_id: first_unuploaded_pre_key_id,
          sessions: sessions,
+         sender_keys: sender_keys,
          pre_keys: pre_keys,
          lid_mappings: lid_mappings
        }}
     end
   end
 
-  defp decode_credentials(_value), do: {:error, :invalid_credentials}
+  defp decode_credentials(_value, _version), do: {:error, :invalid_credentials}
+
+  defp encode_sender_key_entry({address, record}) do
+    encoded = record |> SenderKey.serialize() |> Protobuf.encode() |> encode_binary()
+    {address, encoded}
+  end
+
+  defp decode_sender_keys(_value, 1), do: {:ok, %{}}
+
+  defp decode_sender_keys(%{"sender_keys" => value}, @version) when is_map(value) do
+    decode_map(value, fn address, encoded ->
+      with true <- is_binary(address),
+           {:ok, encoded} <- decode_binary(encoded),
+           record <- encoded |> SenderKeyRecordStructure.decode() |> SenderKey.deserialize() do
+        {:ok, address, record}
+      else
+        _invalid -> {:error, :invalid_credentials}
+      end
+    end)
+  end
+
+  defp decode_sender_keys(_value, @version), do: {:error, :invalid_credentials}
 
   defp encode_key_pair(%{public: public, private: private}) do
     %{"public" => encode_binary(public), "private" => encode_binary(private)}

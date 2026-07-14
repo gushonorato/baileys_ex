@@ -7,8 +7,8 @@ defmodule BaileysExo.ConnectionProcessTest do
   alias BaileysExo.ConnectionProcess
   alias BaileysExo.Crypto.XEdDSA
   alias BaileysExo.Messages.Sender
-  alias BaileysExo.Proto.Message
-  alias BaileysExo.Signal.{SessionBuilder, SessionCipher}
+  alias BaileysExo.Proto.{ADVSignedDeviceIdentity, Message}
+  alias BaileysExo.Signal.{SenderKey, SessionBuilder, SessionCipher}
   alias BaileysExo.{Crypto, Protocol.Pairing}
 
   setup do
@@ -377,6 +377,69 @@ defmodule BaileysExo.ConnectionProcessTest do
 
     assert_receive {:sent_node,
                     %Node{tag: "ack", attrs: %{"class" => "call", "to" => "s.whatsapp.net"}}}
+  end
+
+  test "emits group system upserts before typed effects and acknowledges once", %{state: state} do
+    notification = %Node{
+      tag: "notification",
+      attrs: %{
+        "id" => "group-notification-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "actor@lid",
+        "participant_pn" => "actor@s.whatsapp.net",
+        "addressing_mode" => "lid",
+        "type" => "w:gp2",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "subject", attrs: %{"subject" => "New Subject"}}]
+    }
+
+    assert {:ok, ^state} = ConnectionProcess.dispatch(notification, state)
+
+    assert_receive {:connection_event,
+                    {:messages_upsert, [%{stub_type: :group_change_subject}], :append, nil}}
+
+    assert_receive {:connection_event,
+                    {:group_effect, {:groups_update, [%{subject: "New Subject"}]}}}
+
+    assert_receive {:sent_node,
+                    %Node{
+                      tag: "ack",
+                      attrs: %{
+                        "class" => "notification",
+                        "id" => "group-notification-1",
+                        "participant" => "actor@lid",
+                        "to" => "fixture-group@g.us",
+                        "type" => "w:gp2"
+                      }
+                    }}
+
+    refute_receive {:sent_node, %Node{tag: "ack"}}
+  end
+
+  test "acknowledges and ignores unsupported group operations", %{state: state} do
+    notification = %Node{
+      tag: "notification",
+      attrs: %{
+        "id" => "group-notification-unknown",
+        "from" => "fixture-group@g.us",
+        "type" => "w:gp2",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "future-group-operation"}]
+    }
+
+    assert {:ok, ^state} = ConnectionProcess.dispatch(notification, state)
+    refute_receive {:connection_event, _event}
+
+    assert_receive {:sent_node,
+                    %Node{
+                      tag: "ack",
+                      attrs: %{
+                        "class" => "notification",
+                        "id" => "group-notification-unknown"
+                      }
+                    }}
   end
 
   test "acknowledges a retry without sent material and reports an internal diagnostic", %{
@@ -782,6 +845,245 @@ defmodule BaileysExo.ConnectionProcessTest do
                      }}}
   end
 
+  test "processes sender-key distributions and decrypts group skmsg", %{state: state} do
+    sender_record = sender_key_record(81)
+
+    distribution_content = %Message{
+      senderKeyDistributionMessage: %Message.SenderKeyDistributionMessage{
+        groupId: "fixture-group@g.us",
+        axolotlSenderKeyDistributionMessage: SenderKey.distribution(sender_record)
+      }
+    }
+
+    {local, distribution_node, _raw} = encrypted_incoming_message(distribution_content)
+    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    assert {:ok, state} = ConnectionProcess.dispatch(distribution_node, state)
+
+    sender_key_name =
+      SenderKey.record_key("fixture-group@g.us", "5521999999999@s.whatsapp.net")
+
+    assert Map.has_key?(state.credentials.sender_keys, sender_key_name)
+
+    group_content = %Message{conversation: "group sender-key fixture"}
+    padded = Protobuf.encode(group_content) <> <<1>>
+    assert {:ok, ciphertext, _sender_record} = SenderKey.encrypt(sender_record, padded)
+
+    group_node = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "group-message-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "5521999999999@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "enc", attrs: %{"type" => "skmsg"}, content: ciphertext}]
+    }
+
+    assert {:ok, _state} = ConnectionProcess.dispatch(group_node, state)
+    assert_receive {:sent_node, %Node{tag: "receipt", attrs: %{"to" => "fixture-group@g.us"}}}
+
+    assert_receive {:connection_event,
+                    {:messages_upsert, [%{content: ^group_content} = envelope], :notify, nil}}
+
+    assert envelope.key.remote_jid == "fixture-group@g.us"
+    assert envelope.key.participant == "5521999999999@s.whatsapp.net"
+  end
+
+  test "processes a sender-key distribution before skmsg in the same stanza", %{state: state} do
+    sender_record = sender_key_record(82)
+
+    distribution_content = %Message{
+      senderKeyDistributionMessage: %Message.SenderKeyDistributionMessage{
+        groupId: "fixture-group@g.us",
+        axolotlSenderKeyDistributionMessage: SenderKey.distribution(sender_record)
+      }
+    }
+
+    {local, distribution_node, _raw} = encrypted_incoming_message(distribution_content)
+    group_content = %Message{conversation: "combined sender-key fixture"}
+    padded = Protobuf.encode(group_content) <> <<1>>
+    assert {:ok, ciphertext, _sender_record} = SenderKey.encrypt(sender_record, padded)
+
+    group_node = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "combined-group-message-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "5521999999999@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [
+        %Node{tag: "enc", attrs: %{"type" => "future-cipher"}, content: <<1, 2, 3>>},
+        %Node{tag: "enc", attrs: %{"type" => "skmsg"}, content: ciphertext},
+        hd(distribution_node.content)
+      ]
+    }
+
+    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    assert {:ok, state} = ConnectionProcess.dispatch(group_node, state)
+
+    sender_key_name =
+      SenderKey.record_key("fixture-group@g.us", "5521999999999@s.whatsapp.net")
+
+    assert Map.has_key?(state.credentials.sender_keys, sender_key_name)
+    assert_receive {:sent_node, %Node{tag: "receipt", attrs: %{"to" => "fixture-group@g.us"}}}
+
+    assert_receive {:connection_event, {:messages_upsert, [envelope], :notify, nil}}
+    assert envelope.content.conversation == group_content.conversation
+    assert envelope.content.senderKeyDistributionMessage
+  end
+
+  test "retries a combined stanza when skmsg fails after a valid distribution", %{state: state} do
+    distributed_record = sender_key_record(83)
+
+    distribution_content = %Message{
+      senderKeyDistributionMessage: %Message.SenderKeyDistributionMessage{
+        groupId: "fixture-group@g.us",
+        axolotlSenderKeyDistributionMessage: SenderKey.distribution(distributed_record)
+      }
+    }
+
+    {local, distribution_node, _raw} = encrypted_incoming_message(distribution_content)
+    padded = Protobuf.encode(%Message{conversation: "must not be lost"}) <> <<1>>
+    assert {:ok, ciphertext, _record} = SenderKey.encrypt(sender_key_record(84), padded)
+
+    group_node = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "failed-combined-group-message-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "5521999999999@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [
+        hd(distribution_node.content),
+        %Node{tag: "enc", attrs: %{"type" => "skmsg"}, content: ciphertext}
+      ]
+    }
+
+    state =
+      state
+      |> Map.put(:credentials, local)
+      |> Map.put(:session_path, nil)
+      |> Map.put(:max_retry_count, 5)
+
+    assert {:ok, state} = ConnectionProcess.dispatch(group_node, state)
+
+    sender_key_name =
+      SenderKey.record_key("fixture-group@g.us", "5521999999999@s.whatsapp.net")
+
+    assert Map.has_key?(state.credentials.sender_keys, sender_key_name)
+    refute_receive {:connection_event, {:messages_upsert, _, _, _}}
+    assert_receive {:connection_event, {:error, {:message_decrypt_failed, %{retry?: true}}}}
+    assert_receive {:sent_node, %Node{tag: "receipt", attrs: %{"type" => "retry"}}}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"error" => "500"}}}
+  end
+
+  test "bounds missing sender-key retry receipts without crashing", %{state: state} do
+    node = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "missing-sender-key-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "remote-user:3@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "enc", attrs: %{"type" => "skmsg"}, content: <<51, 1>>}]
+    }
+
+    state =
+      state
+      |> Map.put(:credentials, %{
+        deterministic_credentials(10)
+        | me: %{id: "5511000000000:2@s.whatsapp.net"},
+          account: %ADVSignedDeviceIdentity{
+            details: <<1>>,
+            accountSignatureKey: <<2, 3>>,
+            accountSignature: <<4>>,
+            deviceSignature: <<5>>
+          }
+      })
+      |> Map.put(:incoming_retry_counts, %{})
+      |> Map.put(:max_retry_count, 5)
+
+    state =
+      Enum.reduce(1..7, state, fn expected_attempt, state ->
+        assert {:ok, state} = ConnectionProcess.dispatch(node, state)
+        assert_receive {:connection_event, {:error, {:message_decrypt_failed, diagnostic}}}
+        assert diagnostic.reason in [:missing_sender_key, :invalid_sender_key_message]
+        assert diagnostic.attempt == min(expected_attempt, 5)
+        assert diagnostic.retry? == expected_attempt <= 5
+
+        if expected_attempt <= 5 do
+          assert_receive {:sent_node,
+                          %Node{
+                            tag: "receipt",
+                            attrs: %{"id" => "missing-sender-key-1", "type" => "retry"},
+                            content: [%Node{tag: "retry", attrs: %{"count" => count}} | _]
+                          } = retry}
+
+          assert count == Integer.to_string(expected_attempt)
+
+          if expected_attempt == 2 do
+            keys = NodeUtils.child(retry, "keys")
+            identity = NodeUtils.child(keys, "device-identity")
+            decoded = ADVSignedDeviceIdentity.decode(identity.content)
+            assert decoded.accountSignatureKey == <<2, 3>>
+          end
+        else
+          refute_receive {:sent_node, %Node{tag: "receipt", attrs: %{"type" => "retry"}}}
+        end
+
+        assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"error" => "500"}}}
+        state
+      end)
+
+    assert state.incoming_retry_counts[
+             {"missing-sender-key-1", "remote-user:3@s.whatsapp.net"}
+           ] == 5
+  end
+
+  test "applies a connection-wide budget after retry counter eviction", %{state: state} do
+    state =
+      state
+      |> Map.put(:credentials, %{
+        deterministic_credentials(10)
+        | me: %{id: "5511000000000:2@s.whatsapp.net"}
+      })
+      |> Map.put(:incoming_retry_limit, 1)
+      |> Map.put(:incoming_retry_budget, 2)
+
+    state =
+      Enum.reduce(1..3, state, fn sequence, state ->
+        node = %Node{
+          tag: "message",
+          attrs: %{
+            "id" => "budget-#{sequence}",
+            "from" => "fixture-group@g.us",
+            "participant" => "remote-user:3@s.whatsapp.net",
+            "t" => "1700000000"
+          },
+          content: [%Node{tag: "enc", attrs: %{"type" => "skmsg"}, content: <<51, 1>>}]
+        }
+
+        assert {:ok, state} = ConnectionProcess.dispatch(node, state)
+        assert_receive {:connection_event, {:error, {:message_decrypt_failed, diagnostic}}}
+        assert diagnostic.retry? == sequence <= 2
+
+        if sequence <= 2 do
+          assert_receive {:sent_node, %Node{tag: "receipt", attrs: %{"type" => "retry"}}}
+        else
+          refute_receive {:sent_node, %Node{tag: "receipt", attrs: %{"type" => "retry"}}}
+        end
+
+        assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"error" => "500"}}}
+        state
+      end)
+
+    assert state.incoming_retry_total == 2
+    assert map_size(state.incoming_retry_counts) == 1
+  end
+
   defp retry_state(state, max_retry_count) do
     local = %{
       deterministic_credentials(10)
@@ -931,5 +1233,13 @@ defmodule BaileysExo.ConnectionProcessTest do
     private = :binary.copy(<<seed>>, 32)
     {public, ^private} = :crypto.generate_key(:ecdh, :x25519, private)
     %{public: public, private: private}
+  end
+
+  defp sender_key_record(seed) do
+    signing_key = deterministic_key_pair(seed)
+
+    SenderKey.new_record(
+      SenderKey.new_state(seed, 0, :binary.copy(<<seed + 1>>, 32), signing_key)
+    )
   end
 end

@@ -87,6 +87,8 @@ defmodule Baileys.Message do
           category: String.t() | nil,
           push_name: String.t() | nil,
           verified_business_name: String.t() | nil,
+          stub_type: atom() | nil,
+          stub_parameters: [term()],
           broadcast?: boolean(),
           offline?: boolean(),
           retry_count: non_neg_integer() | nil
@@ -102,9 +104,95 @@ defmodule Baileys.Message do
     :category,
     :push_name,
     :verified_business_name,
+    :stub_type,
+    :stub_parameters,
     :retry_count,
     broadcast?: false,
     offline?: false
+  ]
+end
+
+defmodule Baileys.GroupParticipant do
+  @moduledoc "Group participant with PN/LID alternatives and role."
+  defstruct [:id, :phone_number, :lid, :username, :admin]
+end
+
+defmodule Baileys.GroupMetadata do
+  @moduledoc "Complete metadata emitted when a group is created or discovered."
+
+  @enforce_keys [:id]
+  defstruct [
+    :id,
+    :subject,
+    :addressing_mode,
+    :owner,
+    :owner_pn,
+    :owner_username,
+    :creation,
+    :description,
+    :description_id,
+    :description_owner,
+    :description_owner_pn,
+    :description_owner_username,
+    :description_time,
+    :subject_owner,
+    :subject_owner_pn,
+    :subject_owner_username,
+    :subject_time,
+    :size,
+    :linked_parent,
+    :restrict?,
+    :announce?,
+    :member_add_mode?,
+    :join_approval_mode?,
+    :community?,
+    :community_announce?,
+    :ephemeral_duration,
+    :invite_code,
+    :author,
+    :author_pn,
+    :author_username,
+    participants: []
+  ]
+end
+
+defmodule Baileys.GroupUpdate do
+  @moduledoc "Partial group metadata change."
+  @enforce_keys [:id]
+  defstruct [
+    :id,
+    :subject,
+    :description,
+    :announce?,
+    :restrict?,
+    :member_add_mode?,
+    :ephemeral_duration,
+    :invite_code,
+    :join_approval_mode?,
+    :author,
+    :author_pn,
+    :author_username
+  ]
+end
+
+defmodule Baileys.GroupParticipantsUpdate do
+  @moduledoc "Participant membership or role update."
+  @enforce_keys [:id, :author, :participants, :action]
+  defstruct [:id, :author, :author_pn, :author_username, :participants, :action]
+end
+
+defmodule Baileys.GroupJoinRequest do
+  @moduledoc "Group membership approval request lifecycle update."
+  @enforce_keys [:id, :author, :participant, :action]
+  defstruct [
+    :id,
+    :author,
+    :author_pn,
+    :author_username,
+    :participant,
+    :participant_pn,
+    :action,
+    :method
   ]
 end
 

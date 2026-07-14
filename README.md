@@ -1,6 +1,6 @@
 # Baileys
 
-Minimal, OTP-native WhatsApp linked-device client for text messages.
+Minimal, OTP-native WhatsApp linked-device client.
 
 The protocol implementation runs entirely on the BEAM. There is no Node.js,
 JavaScript bridge, external process, Rustler or third-party native NIF. It uses
@@ -59,14 +59,15 @@ end
 `client` field can be used for synchronous commands inside the callback without
 calling the callback process itself.
 
-`sessions_path` is required and must be absolute. Credentials, prekeys and
-Signal sessions are persisted as `<sessions_path>/<session>.json` using a
-versioned schema and Base64 for binary fields. Files from the previous
-`<sessions_path>/<session>/session.json` layout and legacy `session.etf` files
-are safely migrated on first load. The directory and file modes are `0700` and
-`0600`. Do not run two clients against the same session. Base64 is an encoding,
-not encryption; the JSON file contains secrets and must not be shared or
-committed.
+`sessions_path` is required and must be absolute. Credentials, prekeys, direct
+Signal sessions and group sender-key records are persisted as
+`<sessions_path>/<session>.json` using a versioned schema and Base64 for binary
+fields. Schema v2 adds sender-key storage; schema v1 JSON and files from the
+previous `<sessions_path>/<session>/session.json` layout and legacy
+`session.etf` files are safely migrated on first load. The directory and file
+modes are `0700` and `0600`. Do not run two clients against the same session.
+Base64 is an encoding, not encryption; the JSON file contains secrets and must
+not be shared or committed.
 
 ## QR Pairing
 
@@ -174,6 +175,10 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :messages_update, data: [%Baileys.MessageUpdate{}]}
 %Baileys.Event{client: client, type: :messages_reaction, data: [%Baileys.MessageReaction{}]}
 %Baileys.Event{client: client, type: :message_receipt_update, data: [%Baileys.MessageReceiptUpdate{}]}
+%Baileys.Event{client: client, type: :groups_upsert, data: [%Baileys.GroupMetadata{}]}
+%Baileys.Event{client: client, type: :groups_update, data: [%Baileys.GroupUpdate{}]}
+%Baileys.Event{client: client, type: :group_participants_update, data: %Baileys.GroupParticipantsUpdate{}}
+%Baileys.Event{client: client, type: :group_join_request, data: %Baileys.GroupJoinRequest{}}
 %Baileys.Event{client: client, type: :text_message, data: %Baileys.TextMessage{}}
 %Baileys.Event{client: client, type: :message_status, data: %Baileys.MessageStatus{}}
 %Baileys.Event{client: client, type: :disconnected, data: %Baileys.Disconnected{}}
@@ -201,11 +206,19 @@ Unlike Baileys `7.0.0-rc13`, which stores group `played` receipts in its
 `readTimestamp` field, this client uses the semantically correct
 `played_timestamp` field.
 
-Groups, newsletters, calls, reactions and history synchronization are not yet
-exposed as complete public events.
-Incoming calls and unsupported notifications are still acknowledged at the
-protocol layer so they do not remain pending. Their contents are intentionally
-discarded and no public call, group or notification event is emitted.
+Group messages encrypted with Signal sender keys enter the same authoritative
+`:messages_upsert` stream. Sender-key distribution messages are processed before
+group ciphertext when both occur in one stanza. Missing keys trigger at most
+five retry receipts per message/sender and 100 total during one connection
+lifecycle before further deliveries are only NACKed. Group creation,
+participant changes, subject, description, settings, invite links and
+membership approval operations also emit the typed events listed above after
+their system-message upsert.
+
+Calls and history synchronization are not yet exposed as complete public
+events. Incoming calls and unsupported notifications are still acknowledged at
+the protocol layer so they do not remain pending; unsupported operations are
+discarded without terminating the connection.
 
 ## Lifecycle
 
@@ -230,6 +243,8 @@ The implementation includes:
   documented Baileys revision.
 - XEd25519 signatures implemented in Elixir.
 - Signal X3DH and Double Ratchet for direct messages.
+- Signal sender-key distribution, chain ratchets and skipped-key handling for
+  group messages.
 - USync device/LID discovery and multi-device fanout.
 - Atomic JSON session persistence with safe legacy ETF migration.
 

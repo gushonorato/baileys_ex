@@ -8,6 +8,11 @@ defmodule BaileysExo.Client do
     Connection,
     Disconnected,
     Error,
+    GroupJoinRequest,
+    GroupMetadata,
+    GroupParticipant,
+    GroupParticipantsUpdate,
+    GroupUpdate,
     Message,
     MessageKey,
     MessageReaction,
@@ -56,6 +61,8 @@ defmodule BaileysExo.Client do
       category: envelope.category,
       push_name: envelope.push_name,
       verified_business_name: envelope.verified_business_name,
+      stub_type: Map.get(envelope, :stub_type),
+      stub_parameters: Map.get(envelope, :stub_parameters, []),
       broadcast?: envelope.broadcast,
       offline?: envelope.offline,
       retry_count: envelope.retry_count
@@ -289,6 +296,11 @@ defmodule BaileysExo.Client do
       end)
 
     notify(state, {:message_receipt_update, updates})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:group_effect, {type, payload}}}, state) do
+    notify(state, {type, public_group_effect(type, payload)})
     {:noreply, state}
   end
 
@@ -534,6 +546,30 @@ defmodule BaileysExo.Client do
   end
 
   defp millisecond_timestamp(_timestamp), do: nil
+
+  defp public_group_effect(:groups_upsert, groups) do
+    Enum.map(groups, fn group ->
+      group =
+        Map.update(
+          group,
+          :participants,
+          [],
+          &Enum.map(&1, fn participant -> struct!(GroupParticipant, participant) end)
+        )
+
+      struct!(GroupMetadata, group)
+    end)
+  end
+
+  defp public_group_effect(:groups_update, groups),
+    do: Enum.map(groups, &struct!(GroupUpdate, &1))
+
+  defp public_group_effect(:group_participants_update, update) do
+    participants = Enum.map(update.participants, &struct!(GroupParticipant, &1))
+    struct!(GroupParticipantsUpdate, %{update | participants: participants})
+  end
+
+  defp public_group_effect(:group_join_request, update), do: struct!(GroupJoinRequest, update)
 
   defp notify(state, event) do
     client = self()

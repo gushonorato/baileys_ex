@@ -59,6 +59,12 @@ defmodule BaileysExo.Store.File do
     :root_key,
     :routing_info,
     :sessions,
+    :sender_keys,
+    :states,
+    :sender_key_id,
+    :signing_key,
+    :seed,
+    :iteration,
     :signature,
     :signed_identity_key,
     :signed_key_id,
@@ -156,8 +162,12 @@ defmodule BaileysExo.Store.File do
 
       try do
         case :erlang.binary_to_term(encoded, [:safe]) do
-          %Credentials{} = credentials -> {:ok, credentials}
-          _other -> {:error, :invalid_credentials}
+          %Credentials{} = credentials ->
+            credentials = credentials |> Map.from_struct() |> then(&struct(Credentials, &1))
+            {:ok, credentials}
+
+          _other ->
+            {:error, :invalid_credentials}
         end
       rescue
         ArgumentError -> {:error, :invalid_credentials}

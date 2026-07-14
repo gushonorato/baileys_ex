@@ -22,6 +22,7 @@ defmodule BaileysExo.Auth.Credentials do
     next_pre_key_id: 1,
     first_unuploaded_pre_key_id: 1,
     sessions: %{},
+    sender_keys: %{},
     pre_keys: %{},
     lid_mappings: %{}
   ]

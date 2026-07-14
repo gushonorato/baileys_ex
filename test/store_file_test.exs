@@ -3,6 +3,7 @@ defmodule BaileysExo.Store.FileTest do
 
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Proto.ADVSignedDeviceIdentity
+  alias BaileysExo.Signal.SenderKey
   alias BaileysExo.Store.File, as: FileStore
 
   test "round trips credentials through versioned JSON" do
@@ -14,7 +15,7 @@ defmodule BaileysExo.Store.FileTest do
     path = Path.join(root, "safe.json")
     assert :ok = FileStore.save(path, credentials)
 
-    assert {:ok, %{"version" => 1}} =
+    assert {:ok, %{"version" => 2}} =
              path |> File.read!() |> Jason.decode()
 
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "safe")
@@ -55,6 +56,31 @@ defmodule BaileysExo.Store.FileTest do
     refute File.exists?(legacy_directory)
   end
 
+  test "migrates legacy ETF credentials created before sender-key storage" do
+    root = temporary_root()
+    legacy_directory = Path.join(root, "legacy-old-struct")
+    path = Path.join(root, "legacy-old-struct.json")
+    File.mkdir_p!(legacy_directory)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    credentials = Credentials.new()
+
+    legacy_credentials =
+      credentials
+      |> Map.from_struct()
+      |> Map.delete(:sender_keys)
+      |> Map.put(:__struct__, Credentials)
+
+    File.write!(
+      Path.join(legacy_directory, "session.etf"),
+      :erlang.term_to_binary(legacy_credentials)
+    )
+
+    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy-old-struct")
+    assert File.exists?(path)
+    refute File.exists?(legacy_directory)
+  end
+
   test "round trips prekeys, protobuf account and Signal sessions" do
     root = temporary_root()
     path = Path.join(root, "paired.json")
@@ -73,9 +99,28 @@ defmodule BaileysExo.Store.FileTest do
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
-    File.write!(path, Jason.encode!(%{"version" => 2, "credentials" => %{}}))
+    File.write!(path, Jason.encode!(%{"version" => 3, "credentials" => %{}}))
 
     assert {:error, :unsupported_session_version} = FileStore.load_or_create(root, "future")
+  end
+
+  test "migrates version one JSON with empty sender-key storage" do
+    root = temporary_root()
+    path = Path.join(root, "version-one.json")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    credentials = Credentials.new()
+    assert :ok = FileStore.save(path, credentials)
+    document = path |> File.read!() |> Jason.decode!()
+
+    document =
+      document
+      |> Map.put("version", 1)
+      |> update_in(["credentials"], &Map.delete(&1, "sender_keys"))
+
+    File.write!(path, Jason.encode!(document))
+    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-one")
   end
 
   test "rejects malformed Base64 in JSON credentials" do
@@ -148,6 +193,17 @@ defmodule BaileysExo.Store.FileTest do
       pending_pre_key: %{signed_key_id: 1, pre_key_id: nil, base_key: <<19, 20, 21>>}
     }
 
+    private = :binary.copy(<<31>>, 32)
+    {public, ^private} = :crypto.generate_key(:ecdh, :x25519, private)
+
+    sender_key =
+      SenderKey.new_record(
+        SenderKey.new_state(7, 2, :binary.copy(<<32>>, 32), %{
+          public: public,
+          private: private
+        })
+      )
+
     %{
       credentials
       | me: %{id: "5511999999999:1@s.whatsapp.net", name: "Test", lid: "1:1@lid"},
@@ -162,6 +218,7 @@ defmodule BaileysExo.Store.FileTest do
         registered?: true,
         pre_keys: %{7 => key_pair},
         sessions: %{"5511999999999.1" => %{sessions: %{"session-id" => session}}},
+        sender_keys: %{"fixture-group@g.us::1_1::2" => sender_key},
         lid_mappings: %{"5511999999999@s.whatsapp.net" => "1@lid"}
     }
   end
