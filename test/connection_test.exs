@@ -55,6 +55,11 @@ defmodule BaileysExo.ConnectionProcessTest do
                        ~U[2023-11-14 22:13:20Z], nil}}
     end
 
+    assert_receive {:connection_event, {:messages_update, updates}}
+    assert Enum.map(updates, & &1.key.id) == ["message-1", "message-2"]
+    assert Enum.all?(updates, &(&1.update.status == :read))
+    assert Enum.all?(updates, &(&1.update.timestamp == ~U[2023-11-14 22:13:20Z]))
+
     assert_receive {:sent_node,
                     %Node{
                       tag: "ack",
@@ -101,6 +106,81 @@ defmodule BaileysExo.ConnectionProcessTest do
                      ~U[2000-01-01 00:00:00Z], error}}
 
     assert error == ack.attrs
+
+    assert_receive {:connection_event, {:messages_update, [update]}}
+    assert update.key.id == "message-1"
+    assert update.update.status == :failed
+    assert update.update.error == ack.attrs
+  end
+
+  test "emits per-user group receipt updates without a direct status", %{state: state} do
+    receipt = %Node{
+      tag: "receipt",
+      attrs: %{
+        "id" => "group-message-1",
+        "from" => "fixture-group@g.us",
+        "participant" => "remote-user:3@s.whatsapp.net",
+        "t" => "1700000000",
+        "type" => "played"
+      },
+      content: [
+        %Node{
+          tag: "list",
+          content: [%Node{tag: "item", attrs: %{"id" => "group-message-2"}}]
+        }
+      ]
+    }
+
+    assert {:ok, ^state} = ConnectionProcess.dispatch(receipt, state)
+    refute_receive {:connection_event, {:message_status, _, _, _, _, _}}
+
+    assert_receive {:connection_event, {:message_receipt_update, updates}}
+    assert Enum.map(updates, & &1.key.id) == ["group-message-1", "group-message-2"]
+
+    assert Enum.all?(updates, fn update ->
+             update.key.remote_jid == "fixture-group@g.us" and
+               update.key.participant == "remote-user:3@s.whatsapp.net" and
+               update.receipt.user_jid == "remote-user@s.whatsapp.net" and
+               update.receipt.played_timestamp == ~U[2023-11-14 22:13:20Z]
+           end)
+
+    assert_receive {:sent_node, %Node{tag: "ack"}}
+  end
+
+  test "targets own-device receipts at the recipient conversation", %{state: state} do
+    receipt = %Node{
+      tag: "receipt",
+      attrs: %{
+        "id" => "incoming-message-1",
+        "from" => "5511000000000:7@s.whatsapp.net",
+        "recipient" => "5521999999999@s.whatsapp.net",
+        "t" => "1700000000",
+        "type" => "read-self"
+      }
+    }
+
+    assert {:ok, ^state} = ConnectionProcess.dispatch(receipt, state)
+    assert_receive {:connection_event, {:messages_update, [update]}}
+    assert update.key.remote_jid == "5521999999999@s.whatsapp.net"
+    refute update.key.from_me
+    assert_receive {:sent_node, %Node{tag: "ack"}}
+  end
+
+  test "suppresses group user receipt updates without a participant", %{state: state} do
+    receipt = %Node{
+      tag: "receipt",
+      attrs: %{
+        "id" => "group-message-1",
+        "from" => "fixture-group@g.us",
+        "t" => "1700000000",
+        "type" => "read"
+      }
+    }
+
+    assert {:ok, ^state} = ConnectionProcess.dispatch(receipt, state)
+    refute_receive {:connection_event, {:message_receipt_update, _updates}}
+    refute_receive {:connection_event, {:message_status, _, _, _, _, _}}
+    assert_receive {:sent_node, %Node{tag: "ack"}}
   end
 
   test "acknowledges ignored and malformed receipts", %{state: state} do

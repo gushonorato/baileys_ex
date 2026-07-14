@@ -10,10 +10,14 @@ defmodule BaileysExo.Client do
     Error,
     Message,
     MessageKey,
+    MessageReaction,
+    MessageReceiptUpdate,
     MessageStatus,
+    MessageUpdate,
     MessagesUpsert,
     QR,
-    TextMessage
+    TextMessage,
+    UserReceipt
   }
 
   alias BaileysExo.ConnectionProcess
@@ -44,7 +48,7 @@ defmodule BaileysExo.Client do
   @doc false
   def public_message(envelope) do
     %Message{
-      key: struct!(MessageKey, envelope.key),
+      key: public_key(envelope.key),
       content: envelope.content,
       raw_content: envelope.raw_content,
       timestamp: envelope.timestamp,
@@ -252,13 +256,39 @@ defmodule BaileysExo.Client do
         {:connection_event, {:messages_upsert, envelopes, type, request_id}},
         state
       ) do
+    messages = Enum.map(envelopes, &public_message/1)
+
     upsert = %MessagesUpsert{
-      messages: Enum.map(envelopes, &public_message/1),
+      messages: messages,
       type: type,
       request_id: request_id
     }
 
     notify(state, {:messages_upsert, upsert})
+    project_specialized_message_events(state, messages)
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:messages_update, updates}}, state) do
+    updates =
+      Enum.map(updates, fn update ->
+        %MessageUpdate{key: public_key(update.key), update: update.update}
+      end)
+
+    notify(state, {:messages_update, updates})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:message_receipt_update, updates}}, state) do
+    updates =
+      Enum.map(updates, fn update ->
+        %MessageReceiptUpdate{
+          key: public_key(update.key),
+          receipt: struct!(UserReceipt, update.receipt)
+        }
+      end)
+
+    notify(state, {:message_receipt_update, updates})
     {:noreply, state}
   end
 
@@ -346,6 +376,164 @@ defmodule BaileysExo.Client do
 
   defp message_timestamp(%DateTime{} = timestamp), do: timestamp
   defp message_timestamp(timestamp), do: DateTime.from_unix!(timestamp)
+
+  defp public_key(%MessageKey{} = key), do: key
+  defp public_key(key) when is_map(key), do: struct!(MessageKey, key)
+
+  defp public_target_key(%BaileysExo.Proto.MessageKey{} = key, fallback, from_me, participant) do
+    %MessageKey{
+      remote_jid: key.remoteJid || fallback.remote_jid,
+      remote_jid_alt: fallback.remote_jid_alt,
+      remote_jid_username: fallback.remote_jid_username,
+      from_me: from_me,
+      id: key.id,
+      participant: participant,
+      participant_alt: fallback.participant_alt,
+      participant_username: fallback.participant_username,
+      addressing_mode: fallback.addressing_mode,
+      server_id: fallback.server_id,
+      view_once?: false
+    }
+  end
+
+  defp project_specialized_message_events(state, messages) do
+    me =
+      case Map.get(state, :credentials) do
+        %{me: me} -> me
+        _missing -> nil
+      end
+
+    reactions = Enum.flat_map(messages, &message_reaction(&1, me))
+    updates = Enum.flat_map(messages, &protocol_update/1)
+
+    if reactions != [], do: notify(state, {:messages_reaction, reactions})
+    if updates != [], do: notify(state, {:messages_update, updates})
+  end
+
+  defp message_reaction(%Message{} = message, me) do
+    case normalized_content(message.content) do
+      %BaileysExo.Proto.Message{reactionMessage: reaction}
+      when not is_nil(reaction) and not is_nil(reaction.key) ->
+        [
+          %MessageReaction{
+            target_key: reaction_target_key(reaction.key, message.key, me),
+            reaction: message
+          }
+        ]
+
+      _other ->
+        []
+    end
+  end
+
+  defp message_reaction(_message, _me), do: []
+
+  defp protocol_update(%Message{} = message) do
+    case normalized_content(message.content) do
+      %BaileysExo.Proto.Message{protocolMessage: protocol}
+      when not is_nil(protocol) and not is_nil(protocol.key) ->
+        build_protocol_update(protocol, message)
+
+      _other ->
+        []
+    end
+  end
+
+  defp protocol_update(_message), do: []
+
+  defp build_protocol_update(protocol, message) do
+    target_key = %{message.key | id: protocol.key.id || message.key.id}
+
+    case protocol.type do
+      :REVOKE ->
+        [
+          %MessageUpdate{
+            key: target_key,
+            update: %{deleted?: true, message: nil, timestamp: message.timestamp}
+          }
+        ]
+
+      :MESSAGE_EDIT ->
+        timestamp = millisecond_timestamp(protocol.timestampMs) || message.timestamp
+
+        [
+          %MessageUpdate{
+            key: target_key,
+            update: %{edited?: true, message: protocol.editedMessage, timestamp: timestamp}
+          }
+        ]
+
+      _other ->
+        []
+    end
+  end
+
+  defp reaction_target_key(key, %MessageKey{from_me: false} = fallback, me) do
+    embedded_from_me = key.fromMe == true
+
+    from_me =
+      if embedded_from_me,
+        do: false,
+        else: own_jid?(key.participant || key.remoteJid, me)
+
+    participant = key.participant || fallback.participant
+    key = %{key | remoteJid: fallback.remote_jid}
+    public_target_key(key, fallback, from_me, participant)
+  end
+
+  defp reaction_target_key(key, fallback, _me) do
+    public_target_key(key, fallback, key.fromMe == true, key.participant)
+  end
+
+  defp normalized_content(%BaileysExo.Proto.Message{} = content),
+    do: normalized_content(content, 0)
+
+  defp normalized_content(content), do: content
+
+  defp normalized_content(%BaileysExo.Proto.Message{} = content, depth) when depth < 8 do
+    inner =
+      (content.deviceSentMessage && content.deviceSentMessage.message) ||
+        Enum.find_value(
+          [
+            content.ephemeralMessage,
+            content.viewOnceMessage,
+            content.documentWithCaptionMessage,
+            content.viewOnceMessageV2,
+            content.viewOnceMessageV2Extension,
+            content.editedMessage,
+            content.associatedChildMessage,
+            content.groupStatusMessage,
+            content.groupStatusMessageV2
+          ],
+          &(&1 && &1.message)
+        )
+
+    if inner, do: normalized_content(inner, depth + 1), else: content
+  end
+
+  defp normalized_content(content, _depth), do: content
+
+  defp own_jid?(jid, me) when is_binary(jid) and is_map(me) do
+    Enum.any?([me[:id], me[:lid]], fn own ->
+      with {:ok, left} <- BaileysExo.JID.decode(jid),
+           {:ok, right} <- BaileysExo.JID.decode(own) do
+        left.user == right.user
+      else
+        _invalid -> false
+      end
+    end)
+  end
+
+  defp own_jid?(_jid, _me), do: false
+
+  defp millisecond_timestamp(timestamp) when is_integer(timestamp) do
+    case DateTime.from_unix(timestamp, :millisecond) do
+      {:ok, datetime} -> datetime
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp millisecond_timestamp(_timestamp), do: nil
 
   defp notify(state, event) do
     client = self()

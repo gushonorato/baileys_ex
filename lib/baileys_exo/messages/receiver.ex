@@ -134,6 +134,76 @@ defmodule BaileysExo.Messages.Receiver do
   def receipt_status("played"), do: :played
   def receipt_status(_type), do: :ignore
 
+  def receipt_key(%Node{attrs: attrs}, id, %Credentials{me: me}) do
+    from = attrs["from"] || attrs["to"] || ""
+    stanza_sender = attrs["participant"] || from
+    from_me_node = own_jid?(stanza_sender, me || %{})
+
+    remote_jid =
+      if not from_me_node or grouped_jid?(from),
+        do: from,
+        else: attrs["recipient"] || from
+
+    from_me =
+      is_nil(attrs["recipient"]) or
+        (attrs["type"] in ["retry", "sender"] and from_me_node)
+
+    sender = attrs["participant"] || remote_jid
+
+    mode =
+      case addressing_mode(attrs, sender) do
+        {:ok, mode} -> mode
+        _error -> :pn
+      end
+
+    grouped? = grouped_jid?(remote_jid)
+
+    %{
+      remote_jid: remote_jid,
+      remote_jid_alt: if(grouped?, do: nil, else: sender_alt(attrs, mode)),
+      remote_jid_username: attrs["recipient_username"],
+      from_me: from_me,
+      id: id,
+      participant: attrs["participant"],
+      participant_alt: nil,
+      participant_username: nil,
+      addressing_mode: mode,
+      server_id: nil,
+      view_once?: false
+    }
+  end
+
+  def user_receipt?(node, credentials) do
+    node |> receipt_key("", credentials) |> Map.fetch!(:remote_jid) |> grouped_jid?()
+  end
+
+  def user_receipt(%Node{attrs: %{"participant" => participant}}, status, timestamp)
+      when is_binary(participant) and participant != "" do
+    base = %{
+      user_jid: normalize_user_jid(participant),
+      receipt_timestamp: nil,
+      read_timestamp: nil,
+      played_timestamp: nil,
+      pending_device_jids: [],
+      delivered_device_jids: []
+    }
+
+    case status do
+      :read -> %{base | read_timestamp: timestamp}
+      :played -> %{base | played_timestamp: timestamp}
+      _delivered_or_sent -> %{base | receipt_timestamp: timestamp}
+    end
+  end
+
+  def user_receipt(_node, _status, _timestamp), do: nil
+
+  defp normalize_user_jid(jid) do
+    case JID.decode(jid) do
+      {:ok, decoded} -> JID.encode(decoded.user, decoded.server)
+      {:error, :invalid_jid} -> jid
+    end
+  end
+
   def receipt_timestamp(node, now \\ &DateTime.utc_now/0)
 
   def receipt_timestamp(%Node{attrs: attrs}, now) when is_function(now, 0) do
@@ -302,6 +372,10 @@ defmodule BaileysExo.Messages.Receiver do
       true ->
         {:error, :unsupported_message_source}
     end
+  end
+
+  defp grouped_jid?(jid) do
+    String.ends_with?(jid, "@g.us") or String.ends_with?(jid, "@broadcast")
   end
 
   defp participant_identity(_type, _from, participant, _me)

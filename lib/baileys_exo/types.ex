@@ -121,6 +121,52 @@ defmodule Baileys.MessagesUpsert do
   defstruct [:messages, :type, :request_id]
 end
 
+defmodule Baileys.MessageUpdate do
+  @moduledoc "Update targeting a complete message key."
+
+  @type t :: %__MODULE__{key: Baileys.MessageKey.t(), update: map()}
+  @enforce_keys [:key, :update]
+  defstruct [:key, :update]
+end
+
+defmodule Baileys.UserReceipt do
+  @moduledoc "Per-user receipt timestamps for group or status messages."
+
+  @type t :: %__MODULE__{
+          user_jid: String.t() | nil,
+          receipt_timestamp: DateTime.t() | nil,
+          read_timestamp: DateTime.t() | nil,
+          played_timestamp: DateTime.t() | nil,
+          pending_device_jids: [String.t()],
+          delivered_device_jids: [String.t()]
+        }
+
+  defstruct [
+    :user_jid,
+    :receipt_timestamp,
+    :read_timestamp,
+    :played_timestamp,
+    pending_device_jids: [],
+    delivered_device_jids: []
+  ]
+end
+
+defmodule Baileys.MessageReceiptUpdate do
+  @moduledoc "Per-user receipt update targeting a complete message key."
+
+  @type t :: %__MODULE__{key: Baileys.MessageKey.t(), receipt: Baileys.UserReceipt.t()}
+  @enforce_keys [:key, :receipt]
+  defstruct [:key, :receipt]
+end
+
+defmodule Baileys.MessageReaction do
+  @moduledoc "Reaction with separate target and author/event message keys."
+
+  @type t :: %__MODULE__{target_key: Baileys.MessageKey.t(), reaction: Baileys.Message.t()}
+  @enforce_keys [:target_key, :reaction]
+  defstruct [:target_key, :reaction]
+end
+
 defmodule Baileys.SentMessage do
   @moduledoc "Text message accepted by the WhatsApp transport."
 

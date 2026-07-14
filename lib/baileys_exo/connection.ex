@@ -441,10 +441,23 @@ defmodule BaileysExo.ConnectionProcess do
 
   defp handle_node(%Node{tag: "ack", attrs: %{"class" => "message", "id" => id}} = node, state) do
     if node.attrs["error"] do
+      timestamp = Receiver.receipt_timestamp(node, receipt_clock(state))
+
       send(state.owner, {
         :connection_event,
-        {:message_status, id, node.attrs["from"] || node.attrs["to"], :failed,
-         Receiver.receipt_timestamp(node, receipt_clock(state)), node.attrs}
+        {:message_status, id, node.attrs["from"] || node.attrs["to"], :failed, timestamp,
+         node.attrs}
+      })
+
+      send(state.owner, {
+        :connection_event,
+        {:messages_update,
+         [
+           %{
+             key: Receiver.receipt_key(node, id, state.credentials),
+             update: %{status: :failed, timestamp: timestamp, error: node.attrs}
+           }
+         ]}
       })
     end
 
@@ -870,10 +883,45 @@ defmodule BaileysExo.ConnectionProcess do
     if status != :ignore do
       at = Receiver.receipt_timestamp(node, receipt_clock(state))
       to = node.attrs["from"] || node.attrs["to"]
+      ids = Receiver.receipt_ids(node)
 
-      Enum.each(Receiver.receipt_ids(node), fn id ->
-        send(state.owner, {:connection_event, {:message_status, id, to, status, at, nil}})
-      end)
+      if Receiver.user_receipt?(node, state.credentials) do
+        updates =
+          Enum.flat_map(ids, fn id ->
+            case Receiver.user_receipt(node, status, at) do
+              nil ->
+                []
+
+              receipt ->
+                [
+                  %{
+                    key: Receiver.receipt_key(node, id, state.credentials),
+                    receipt: receipt
+                  }
+                ]
+            end
+          end)
+
+        if updates != [] do
+          send(state.owner, {:connection_event, {:message_receipt_update, updates}})
+        end
+      else
+        Enum.each(ids, fn id ->
+          send(state.owner, {:connection_event, {:message_status, id, to, status, at, nil}})
+        end)
+
+        updates =
+          Enum.map(ids, fn id ->
+            %{
+              key: Receiver.receipt_key(node, id, state.credentials),
+              update: %{status: status, timestamp: at, error: nil}
+            }
+          end)
+
+        if updates != [] do
+          send(state.owner, {:connection_event, {:messages_update, updates}})
+        end
+      end
     end
   end
 

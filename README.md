@@ -171,6 +171,9 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :qr, data: %Baileys.QR{}}
 %Baileys.Event{client: client, type: :paired, data: %Baileys.Account{}}
 %Baileys.Event{client: client, type: :messages_upsert, data: %Baileys.MessagesUpsert{}}
+%Baileys.Event{client: client, type: :messages_update, data: [%Baileys.MessageUpdate{}]}
+%Baileys.Event{client: client, type: :messages_reaction, data: [%Baileys.MessageReaction{}]}
+%Baileys.Event{client: client, type: :message_receipt_update, data: [%Baileys.MessageReceiptUpdate{}]}
 %Baileys.Event{client: client, type: :text_message, data: %Baileys.TextMessage{}}
 %Baileys.Event{client: client, type: :message_status, data: %Baileys.MessageStatus{}}
 %Baileys.Event{client: client, type: :disconnected, data: %Baileys.Disconnected{}}
@@ -184,6 +187,19 @@ and stanza metadata. Online messages use `type: :notify`; offline messages use
 `:messages_upsert` and the derived `:text_message` event. Media protobuf content
 is observable, but media download and high-level media handling are not yet
 provided.
+
+Direct receipts produce `:messages_update` batches and continue producing the
+legacy `:message_status` projection. Group and status receipts instead produce
+per-user `:message_receipt_update` batches and are not collapsed into a direct
+status. Reactions preserve both the target key and the complete author/event
+message; an empty reaction text represents removal. Revoke and edit protocol
+messages remain in the upsert stream and additionally produce targeted
+`:messages_update` entries. Successful server ACKs remain silent, while failed
+ACKs produce both the complete update and legacy failed status.
+
+Unlike Baileys `7.0.0-rc13`, which stores group `played` receipts in its
+`readTimestamp` field, this client uses the semantically correct
+`played_timestamp` field.
 
 Groups, newsletters, calls, reactions and history synchronization are not yet
 exposed as complete public events.
