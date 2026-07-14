@@ -3,7 +3,18 @@ defmodule BaileysExo.Client do
 
   use GenServer
 
-  alias Baileys.{Account, Connection, Disconnected, Error, MessageStatus, QR, TextMessage}
+  alias Baileys.{
+    Account,
+    Connection,
+    Disconnected,
+    Error,
+    Message,
+    MessageKey,
+    MessageStatus,
+    QR,
+    TextMessage
+  }
+
   alias BaileysExo.ConnectionProcess
   alias BaileysExo.Messages.Sender
   alias BaileysExo.Store.File, as: FileStore
@@ -28,6 +39,23 @@ defmodule BaileysExo.Client do
   def status(client), do: GenServer.call(client, :status)
   def subscribe(client, subscriber), do: GenServer.call(client, {:subscribe, subscriber})
   def unsubscribe(client, subscriber), do: GenServer.call(client, {:unsubscribe, subscriber})
+
+  @doc false
+  def public_message(envelope) do
+    %Message{
+      key: struct!(MessageKey, envelope.key),
+      content: envelope.content,
+      raw_content: envelope.raw_content,
+      timestamp: envelope.timestamp,
+      status: envelope.status,
+      category: envelope.category,
+      push_name: envelope.push_name,
+      verified_business_name: envelope.verified_business_name,
+      broadcast?: envelope.broadcast,
+      offline?: envelope.offline,
+      retry_count: envelope.retry_count
+    }
+  end
 
   @impl true
   def init(options) do
@@ -211,7 +239,7 @@ defmodule BaileysExo.Client do
       sender_jid: metadata.sender_jid,
       from_me: metadata.from_me,
       text: text,
-      timestamp: DateTime.from_unix!(metadata.timestamp),
+      timestamp: message_timestamp(metadata.timestamp),
       offline?: metadata.offline
     }
 
@@ -300,6 +328,9 @@ defmodule BaileysExo.Client do
   end
 
   defp validate_session(_session), do: {:error, :invalid_session}
+
+  defp message_timestamp(%DateTime{} = timestamp), do: timestamp
+  defp message_timestamp(timestamp), do: DateTime.from_unix!(timestamp)
 
   defp notify(state, event) do
     client = self()

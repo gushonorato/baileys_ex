@@ -42,6 +42,72 @@ defmodule Baileys.TextMessage do
   defstruct [:id, :chat_jid, :sender_jid, :text, :timestamp, from_me: false, offline?: false]
 end
 
+defmodule Baileys.MessageKey do
+  @moduledoc "Complete WhatsApp message identity with PN/LID alternatives preserved."
+
+  @type t :: %__MODULE__{
+          remote_jid: String.t(),
+          remote_jid_alt: String.t() | nil,
+          remote_jid_username: String.t() | nil,
+          from_me: boolean(),
+          id: String.t(),
+          participant: String.t() | nil,
+          participant_alt: String.t() | nil,
+          participant_username: String.t() | nil,
+          addressing_mode: :pn | :lid,
+          server_id: String.t() | nil,
+          view_once?: boolean()
+        }
+
+  @enforce_keys [:remote_jid, :from_me, :id, :addressing_mode]
+  defstruct [
+    :remote_jid,
+    :remote_jid_alt,
+    :remote_jid_username,
+    :id,
+    :participant,
+    :participant_alt,
+    :participant_username,
+    :addressing_mode,
+    :server_id,
+    from_me: false,
+    view_once?: false
+  ]
+end
+
+defmodule Baileys.Message do
+  @moduledoc "Lossless decoded message envelope used by complete message events."
+
+  @type t :: %__MODULE__{
+          key: Baileys.MessageKey.t(),
+          content: struct() | nil,
+          raw_content: binary() | nil,
+          timestamp: DateTime.t() | nil,
+          status: atom() | nil,
+          category: String.t() | nil,
+          push_name: String.t() | nil,
+          verified_business_name: String.t() | nil,
+          broadcast?: boolean(),
+          offline?: boolean(),
+          retry_count: non_neg_integer() | nil
+        }
+
+  @enforce_keys [:key]
+  defstruct [
+    :key,
+    :content,
+    :raw_content,
+    :timestamp,
+    :status,
+    :category,
+    :push_name,
+    :verified_business_name,
+    :retry_count,
+    broadcast?: false,
+    offline?: false
+  ]
+end
+
 defmodule Baileys.SentMessage do
   @moduledoc "Text message accepted by the WhatsApp transport."
 

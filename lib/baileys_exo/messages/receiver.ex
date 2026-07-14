@@ -4,43 +4,116 @@ defmodule BaileysExo.Messages.Receiver do
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.{Node, NodeUtils}
   alias BaileysExo.JID
-  alias BaileysExo.Proto.Message
+  alias BaileysExo.Proto.{Message, VerifiedNameCertificate}
 
   @nack_unhandled_error "500"
 
-  def context(%Node{attrs: attrs}, %Credentials{me: me}) when is_map(me) do
-    with id when is_binary(id) <- attrs["id"],
-         from when is_binary(from) <- attrs["from"] do
-      from_me = own_jid?(from, me)
-      sender = attrs["participant"] || from
-      lid_addressed? = attrs["addressing_mode"] == "lid" || String.ends_with?(sender, "@lid")
-      sender_alt = if lid_addressed?, do: phone_sender(attrs)
-      wire_chat_jid = if from_me, do: attrs["recipient"] || from, else: from
-      chat_jid = display_chat_jid(attrs, wire_chat_jid, sender_alt, from_me, lid_addressed?)
-      sender_jid = sender_alt || sender
+  def context(node, credentials, now \\ &DateTime.utc_now/0)
 
-      signal_jid =
-        if lid_addressed?,
-          do: sender,
-          else: attrs["participant_lid"] || attrs["sender_lid"] || sender
+  def context(%Node{attrs: attrs} = node, %Credentials{me: me} = credentials, now)
+      when is_map(me) and is_function(now, 0) do
+    with id when is_binary(id) and id != "" <- attrs["id"],
+         from when is_binary(from) and from != "" <- attrs["from"],
+         {:ok, identity} <- message_identity(attrs, from, me),
+         {:ok, addressing_mode} <- addressing_mode(attrs, attrs["participant"] || from) do
+      sender = attrs["participant"] || from
+      sender_alt = sender_alt(attrs, addressing_mode)
+      recipient_alt = recipient_alt(attrs, addressing_mode)
+      group? = identity.type == :group
+
+      key = %{
+        remote_jid: identity.chat_jid,
+        remote_jid_alt: if(group?, do: nil, else: sender_alt),
+        remote_jid_username:
+          if(group?,
+            do: nil,
+            else: attrs["peer_recipient_username"] || attrs["recipient_username"]
+          ),
+        from_me: identity.from_me,
+        id: id,
+        participant: attrs["participant"],
+        participant_alt: if(group?, do: sender_alt),
+        participant_username: if(attrs["participant"], do: attrs["participant_username"]),
+        addressing_mode: addressing_mode,
+        server_id: if(identity.type == :newsletter, do: attrs["server_id"]),
+        view_once?: view_once?(node)
+      }
+
+      chat_jid =
+        display_chat_jid(
+          identity.type,
+          identity.chat_jid,
+          sender_alt,
+          recipient_alt,
+          identity.from_me,
+          addressing_mode
+        )
+
+      signal_jid = signal_jid(addressing_mode, identity.author, sender_alt, credentials)
+      response = protocol_response(node, credentials, attrs, id, from, identity)
 
       {:ok,
        %{
          id: id,
+         key: key,
          chat_jid: chat_jid,
-         sender_jid: sender_jid,
+         sender_jid: if(addressing_mode == :lid, do: sender_alt || sender, else: sender),
          signal_jid: signal_jid,
-         from_me: from_me,
-         timestamp: parse_integer(attrs["t"]) || System.system_time(:second),
+         wire_chat_jid: identity.chat_jid,
+         wire_sender_jid: identity.author,
+         from_me: identity.from_me,
+         timestamp: message_timestamp(attrs["t"], now),
+         status: if(identity.from_me, do: :server_ack),
+         category: attrs["category"],
+         push_name: attrs["notify"],
+         verified_business_name: verified_business_name(node),
+         broadcast: identity.type == :broadcast,
          offline: Map.has_key?(attrs, "offline"),
-         receipt_attrs: receipt_attrs(attrs, id, from, wire_chat_jid, from_me)
+         retry_count: retry_count(node),
+         protocol_response: response,
+         receipt_attrs: if(response.tag == "receipt", do: response.attrs)
        }}
     else
+      {:error, _reason} = error -> error
       _missing -> {:error, :invalid_message_stanza}
     end
   end
 
-  def context(_node, _credentials), do: {:error, :invalid_message_stanza}
+  def context(_node, _credentials, _now), do: {:error, :invalid_message_stanza}
+
+  def envelope(context, %Message{} = content, raw_content) when is_binary(raw_content) do
+    %{
+      key: context.key,
+      content: content,
+      raw_content: raw_content,
+      timestamp: context.timestamp,
+      status: context.status,
+      category: context.category,
+      push_name: context.push_name,
+      verified_business_name: context.verified_business_name,
+      broadcast: context.broadcast,
+      offline: context.offline,
+      retry_count: context.retry_count,
+      chat_jid: context.chat_jid,
+      sender_jid: context.sender_jid,
+      signal_jid: context.signal_jid,
+      wire_chat_jid: context.wire_chat_jid,
+      wire_sender_jid: context.wire_sender_jid,
+      protocol_response: context.protocol_response,
+      receipt_attrs: context.receipt_attrs
+    }
+  end
+
+  def text_metadata(envelope) do
+    %{
+      id: envelope.key.id,
+      chat_jid: envelope.chat_jid,
+      sender_jid: envelope.sender_jid,
+      from_me: envelope.key.from_me,
+      timestamp: envelope.timestamp,
+      offline: envelope.offline
+    }
+  end
 
   def receipt_ids(%Node{} = node) do
     item_ids =
@@ -150,45 +223,199 @@ defmodule BaileysExo.Messages.Receiver do
     )
   end
 
-  defp receipt_attrs(attrs, id, from, chat_jid, true) do
+  defp direct_receipt_attrs(attrs, id, from, chat_jid, true) do
     %{"id" => id, "to" => from, "recipient" => chat_jid, "type" => "sender"}
     |> maybe_put("participant", attrs["participant"])
   end
 
-  defp receipt_attrs(attrs, id, from, _chat_jid, false = _from_me) do
+  defp direct_receipt_attrs(attrs, id, from, _chat_jid, false = _from_me) do
     %{"id" => id, "to" => from}
     |> maybe_put("participant", attrs["participant"])
   end
 
-  defp phone_sender(attrs) do
+  defp protocol_response(node, credentials, _attrs, _id, _from, %{type: :newsletter}) do
+    ack(node, credentials)
+  end
+
+  defp protocol_response(
+         _node,
+         _credentials,
+         %{"category" => "peer"} = attrs,
+         id,
+         _from,
+         %{type: :direct} = identity
+       ) do
+    receipt =
+      %{"id" => id, "to" => identity.chat_jid, "type" => "peer_msg"}
+      |> maybe_put("participant", attrs["participant"])
+
+    %Node{tag: "receipt", attrs: receipt}
+  end
+
+  defp protocol_response(_node, _credentials, attrs, id, from, %{type: :direct} = identity) do
+    receipt = direct_receipt_attrs(attrs, id, from, identity.chat_jid, identity.from_me)
+    %Node{tag: "receipt", attrs: maybe_peer_receipt(receipt, attrs)}
+  end
+
+  defp protocol_response(_node, _credentials, attrs, id, _from, identity) do
+    receipt =
+      %{"id" => id, "to" => identity.chat_jid, "participant" => identity.author}
+      |> maybe_put("type", if(identity.from_me, do: "sender"))
+      |> maybe_peer_receipt(attrs)
+
+    %Node{tag: "receipt", attrs: receipt}
+  end
+
+  defp maybe_peer_receipt(receipt, %{"category" => "peer"}),
+    do: Map.put(receipt, "type", "peer_msg")
+
+  defp maybe_peer_receipt(receipt, _attrs), do: receipt
+
+  defp message_identity(attrs, from, me) do
+    participant = attrs["participant"]
+
+    cond do
+      JID.direct?(from) ->
+        from_me = own_jid?(from, me)
+
+        if attrs["recipient"] && not from_me && not meta_recipient?(attrs["recipient"]) do
+          {:error, :invalid_message_recipient}
+        else
+          {:ok,
+           %{
+             type: :direct,
+             chat_jid: if(from_me, do: attrs["recipient"] || from, else: from),
+             author: from,
+             from_me: from_me
+           }}
+        end
+
+      String.ends_with?(from, "@g.us") ->
+        participant_identity(:group, from, participant, me)
+
+      String.ends_with?(from, "@broadcast") ->
+        participant_identity(:broadcast, from, participant, me)
+
+      String.ends_with?(from, "@newsletter") ->
+        {:ok, %{type: :newsletter, chat_jid: from, author: from, from_me: own_jid?(from, me)}}
+
+      true ->
+        {:error, :unsupported_message_source}
+    end
+  end
+
+  defp participant_identity(_type, _from, participant, _me)
+       when not is_binary(participant) or participant == "",
+       do: {:error, :missing_group_participant}
+
+  defp participant_identity(type, from, participant, me) do
+    {:ok,
+     %{
+       type: type,
+       chat_jid: from,
+       author: participant,
+       from_me: own_jid?(participant, me)
+     }}
+  end
+
+  defp addressing_mode(%{"addressing_mode" => "lid"}, _sender), do: {:ok, :lid}
+  defp addressing_mode(%{"addressing_mode" => "pn"}, _sender), do: {:ok, :pn}
+
+  defp addressing_mode(%{"addressing_mode" => mode}, _sender) when is_binary(mode),
+    do: {:error, :invalid_addressing_mode}
+
+  defp addressing_mode(_attrs, sender) do
+    if String.ends_with?(sender, "@lid") or String.ends_with?(sender, "@hosted.lid"),
+      do: {:ok, :lid},
+      else: {:ok, :pn}
+  end
+
+  defp sender_alt(attrs, :lid) do
     attrs["participant_pn"] || attrs["sender_pn"] || attrs["peer_recipient_pn"]
   end
 
-  defp display_chat_jid(attrs, wire_chat_jid, _sender_alt, true, true) do
-    attrs["recipient_pn"] || wire_chat_jid
+  defp sender_alt(attrs, :pn) do
+    attrs["participant_lid"] || attrs["sender_lid"] || attrs["peer_recipient_lid"]
   end
 
-  defp display_chat_jid(_attrs, _wire_chat_jid, sender_alt, false, true)
-       when is_binary(sender_alt),
-       do: sender_alt
+  defp recipient_alt(attrs, :lid), do: attrs["recipient_pn"]
+  defp recipient_alt(attrs, :pn), do: attrs["recipient_lid"]
 
-  defp display_chat_jid(_attrs, wire_chat_jid, _sender_alt, _from_me, _lid_addressed?),
+  defp display_chat_jid(:direct, wire_chat_jid, sender_alt, recipient_alt, from_me, :lid) do
+    if from_me, do: recipient_alt || wire_chat_jid, else: sender_alt || wire_chat_jid
+  end
+
+  defp display_chat_jid(_type, wire_chat_jid, _sender_alt, _recipient_alt, _from_me, _mode),
     do: wire_chat_jid
 
-  defp own_jid?(jid, me) do
-    Enum.any?([me[:id], me[:lid]], &same_user?(jid, &1))
+  defp message_timestamp(value, now) do
+    with timestamp when is_integer(timestamp) and timestamp >= 0 <- parse_integer(value),
+         {:ok, datetime} <- DateTime.from_unix(timestamp) do
+      datetime
+    else
+      _invalid -> now.()
+    end
   end
 
-  defp same_user?(left, right) when is_binary(left) and is_binary(right) do
+  defp retry_count(node) do
+    node
+    |> NodeUtils.children("enc")
+    |> Enum.find_value(fn encrypted ->
+      case parse_integer(encrypted.attrs["count"]) do
+        count when is_integer(count) and count >= 0 -> count
+        _invalid -> nil
+      end
+    end)
+  end
+
+  defp view_once?(node) do
+    match?(%Node{attrs: %{"type" => "view_once"}}, NodeUtils.child(node, "unavailable"))
+  end
+
+  defp signal_jid(:lid, author, _sender_alt, _credentials), do: author
+
+  defp signal_jid(:pn, _author, sender_alt, _credentials) when is_binary(sender_alt),
+    do: sender_alt
+
+  defp signal_jid(:pn, author, _sender_alt, credentials) do
+    with {:ok, decoded} <- JID.decode(author),
+         bare = JID.encode(decoded.user, decoded.server),
+         mapped when is_binary(mapped) <- credentials.lid_mappings[bare],
+         {:ok, mapped} <- JID.decode(mapped) do
+      JID.encode(mapped.user, mapped.server, decoded.device)
+    else
+      _missing_or_invalid -> author
+    end
+  end
+
+  defp meta_recipient?(jid), do: String.ends_with?(jid, "@bot")
+
+  defp verified_business_name(node) do
+    with %Node{content: content} when is_binary(content) <- NodeUtils.child(node, "verified_name"),
+         certificate <- VerifiedNameCertificate.decode(content),
+         details when is_binary(details) <- certificate.details do
+      details |> VerifiedNameCertificate.Details.decode() |> Map.get(:verifiedName)
+    else
+      _missing_or_invalid -> nil
+    end
+  rescue
+    _invalid -> nil
+  end
+
+  defp own_jid?(jid, me) do
+    Enum.any?([me[:id], me[:lid]], &same_account?(jid, &1))
+  end
+
+  defp same_account?(left, right) when is_binary(left) and is_binary(right) do
     with {:ok, left} <- JID.decode(left),
          {:ok, right} <- JID.decode(right) do
-      left.user == right.user and left.server == right.server
+      left.user == right.user
     else
       _invalid -> false
     end
   end
 
-  defp same_user?(_left, _right), do: false
+  defp same_account?(_left, _right), do: false
 
   defp maybe_put_message_from(attrs, "message", from), do: maybe_put(attrs, "from", from)
   defp maybe_put_message_from(attrs, _tag, _from), do: attrs

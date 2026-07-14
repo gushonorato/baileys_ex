@@ -405,14 +405,23 @@ defmodule BaileysExo.ConnectionProcess do
   defp handle_node(%Node{tag: "message"} = node, state) do
     if NodeUtils.child(node, "enc") do
       case decrypt_message(node, state.credentials) do
-        {:ok, text, credentials, metadata, receipt_attrs} ->
-          with {:ok, state} <- acknowledge_message(credentials, receipt_attrs, state) do
-            send(state.owner, {:connection_event, {:text_message, metadata, text}})
+        {:ok, envelope, credentials, protocol_response} ->
+          with {:ok, state} <- acknowledge_message(credentials, protocol_response, state) do
+            projection =
+              (envelope.content.deviceSentMessage && envelope.content.deviceSentMessage.message) ||
+                envelope.content
+
+            case Receiver.extract_text(projection) do
+              {:ok, text} ->
+                metadata = Receiver.text_metadata(envelope)
+                send(state.owner, {:connection_event, {:text_message, metadata, text}})
+
+              :unsupported ->
+                :ok
+            end
+
             {:ok, state}
           end
-
-        {:ignored, credentials, receipt_attrs} ->
-          acknowledge_message(credentials, receipt_attrs, state)
 
         {:error, reason} ->
           send(state.owner, {:connection_event, {:error, {:message_decrypt_failed, reason}}})
@@ -603,8 +612,7 @@ defmodule BaileysExo.ConnectionProcess do
          {:ok, plaintext, record, used_pre_key} <-
            decrypt_signal(encrypted.attrs["type"], record, ciphertext, credentials),
          {:ok, unpadded} <- unpad_message(plaintext),
-         message <- Message.decode(unpadded),
-         message <- (message.deviceSentMessage && message.deviceSentMessage.message) || message do
+         message <- Message.decode(unpadded) do
       credentials = put_in(credentials.sessions[address], record)
 
       credentials =
@@ -612,22 +620,8 @@ defmodule BaileysExo.ConnectionProcess do
           do: %{credentials | pre_keys: Map.delete(credentials.pre_keys, used_pre_key)},
           else: credentials
 
-      case Receiver.extract_text(message) do
-        {:ok, text} ->
-          metadata = %{
-            id: context.id,
-            chat_jid: context.chat_jid,
-            sender_jid: context.sender_jid,
-            from_me: context.from_me,
-            timestamp: context.timestamp,
-            offline: context.offline
-          }
-
-          {:ok, text, credentials, metadata, context.receipt_attrs}
-
-        :unsupported ->
-          {:ignored, credentials, context.receipt_attrs}
-      end
+      envelope = Receiver.envelope(context, message, unpadded)
+      {:ok, envelope, credentials, context.protocol_response}
     else
       nil -> {:error, :missing_encrypted_message}
       false -> {:error, :invalid_encrypted_message}
@@ -638,10 +632,10 @@ defmodule BaileysExo.ConnectionProcess do
     error -> {:error, error}
   end
 
-  defp acknowledge_message(credentials, receipt_attrs, state) do
+  defp acknowledge_message(credentials, protocol_response, state) do
     with :ok <- persist_credentials(state.session_path, credentials),
          {:ok, state} <-
-           send_node(%Node{tag: "receipt", attrs: receipt_attrs}, %{
+           send_node(protocol_response, %{
              state
              | credentials: credentials
            }) do
