@@ -170,14 +170,23 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :connection, data: %Baileys.Connection{}}
 %Baileys.Event{client: client, type: :qr, data: %Baileys.QR{}}
 %Baileys.Event{client: client, type: :paired, data: %Baileys.Account{}}
+%Baileys.Event{client: client, type: :messages_upsert, data: %Baileys.MessagesUpsert{}}
 %Baileys.Event{client: client, type: :text_message, data: %Baileys.TextMessage{}}
 %Baileys.Event{client: client, type: :message_status, data: %Baileys.MessageStatus{}}
 %Baileys.Event{client: client, type: :disconnected, data: %Baileys.Disconnected{}}
 %Baileys.Event{client: client, type: :error, data: %Baileys.Error{}}
 ```
 
-Only direct text messages are in scope. Groups, media, newsletters, calls,
-reactions and history synchronization are intentionally not exposed.
+`:messages_upsert` is the authoritative complete-message event. It preserves the
+decoded protobuf content, original wrappers, raw protobuf bytes, complete key
+and stanza metadata. Online messages use `type: :notify`; offline messages use
+`:append`. During the compatibility window, supported direct text emits both
+`:messages_upsert` and the derived `:text_message` event. Media protobuf content
+is observable, but media download and high-level media handling are not yet
+provided.
+
+Groups, newsletters, calls, reactions and history synchronization are not yet
+exposed as complete public events.
 Incoming calls and unsupported notifications are still acknowledged at the
 protocol layer so they do not remain pending. Their contents are intentionally
 discarded and no public call, group or notification event is emitted.

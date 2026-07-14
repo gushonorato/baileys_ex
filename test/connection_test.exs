@@ -617,47 +617,11 @@ defmodule BaileysExo.ConnectionProcessTest do
        %{
          state: state
        } do
-    local = %{deterministic_credentials(50) | me: %{id: "5511000000000:2@s.whatsapp.net"}}
-    local_pre_key = deterministic_key_pair(59)
-    local = %{local | pre_keys: %{7 => local_pre_key}}
-    remote = deterministic_credentials(60)
-
-    bundle = %{
-      registration_id: local.registration_id,
-      identity_key: <<5, local.signed_identity_key.public::binary>>,
-      signed_pre_key: %{
-        key_id: local.signed_pre_key.key_id,
-        public: <<5, local.signed_pre_key.key_pair.public::binary>>,
-        signature: local.signed_pre_key.signature
-      },
-      pre_key: %{key_id: 7, public: <<5, local_pre_key.public::binary>>}
+    content = %Message{
+      extendedTextMessage: %Message.ExtendedTextMessage{text: "injected transport"}
     }
 
-    assert {:ok, remote_record} =
-             SessionBuilder.init_outgoing(nil, bundle, remote.signed_identity_key)
-
-    plaintext =
-      %Message{extendedTextMessage: %Message.ExtendedTextMessage{text: "injected transport"}}
-      |> Protobuf.encode()
-      |> Kernel.<>(<<1>>)
-
-    assert {:ok, :pkmsg, ciphertext, _remote_record} =
-             SessionCipher.encrypt(
-               remote_record,
-               plaintext,
-               remote.signed_identity_key,
-               remote.registration_id
-             )
-
-    message = %Node{
-      tag: "message",
-      attrs: %{
-        "id" => "incoming-integration-1",
-        "from" => "5521999999999@s.whatsapp.net",
-        "t" => "1700000000"
-      },
-      content: [%Node{tag: "enc", attrs: %{"type" => "pkmsg"}, content: ciphertext}]
-    }
+    {local, message, raw} = encrypted_incoming_message(content)
 
     state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
     assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
@@ -671,12 +635,71 @@ defmodule BaileysExo.ConnectionProcessTest do
                       }
                     }}
 
+    assert_receive {:connection_event, {:credentials, _credentials}}
+    assert_receive {:connection_event, {:messages_upsert, [envelope], :notify, nil}}
+    assert envelope.key.id == "incoming-integration-1"
+    assert envelope.content == content
+    assert envelope.raw_content == raw
+    assert envelope.timestamp == ~U[2023-11-14 22:13:20Z]
+
     assert_receive {:connection_event,
                     {:text_message,
                      %{
                        id: "incoming-integration-1",
                        chat_jid: "5521999999999@s.whatsapp.net"
-                     }, "injected transport"}}
+                     } = metadata, "injected transport"}}
+
+    public = Client.public_message(envelope)
+    assert public.key.id == metadata.id
+    assert public.key.remote_jid == metadata.chat_jid
+    assert public.key.from_me == metadata.from_me
+    assert public.timestamp == metadata.timestamp
+  end
+
+  test "offline media emits an append upsert and receipt without a text projection", %{
+    state: state
+  } do
+    content = %Message{imageMessage: %Message.ImageMessage{caption: "fixture image"}}
+
+    {local, message, raw} =
+      encrypted_incoming_message(content, %{
+        "id" => "incoming-media-1",
+        "offline" => "1"
+      })
+
+    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
+    assert_receive {:sent_node, %Node{tag: "receipt"}}
+    assert_receive {:connection_event, {:messages_upsert, [envelope], :append, nil}}
+    assert envelope.content.imageMessage.caption == "fixture image"
+    assert envelope.raw_content == raw
+    refute_receive {:connection_event, {:text_message, _, _}}
+  end
+
+  test "client projects complete envelopes into a public upsert batch", %{state: state} do
+    content = %Message{conversation: "public upsert"}
+    {local, message, _raw} = encrypted_incoming_message(content)
+    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
+    assert_receive {:connection_event, {:messages_upsert, [envelope], :notify, nil}}
+
+    client_state = %{subscribers: %{self() => make_ref()}}
+
+    assert {:noreply, ^client_state} =
+             Client.handle_info(
+               {:connection_event, {:messages_upsert, [envelope], :notify, nil}},
+               client_state
+             )
+
+    client = self()
+
+    assert_receive {:baileys, ^client,
+                    {:messages_upsert,
+                     %Baileys.MessagesUpsert{
+                       messages: [%Baileys.Message{content: ^content}],
+                       type: :notify,
+                       request_id: nil
+                     }}}
   end
 
   defp retry_state(state, max_retry_count) do
@@ -756,6 +779,54 @@ defmodule BaileysExo.ConnectionProcessTest do
     padding = :binary.last(padded)
     decoded = padded |> binary_part(0, byte_size(padded) - padding) |> Message.decode()
     decoded.extendedTextMessage.text
+  end
+
+  defp encrypted_incoming_message(content, attrs \\ %{}) do
+    local = %{deterministic_credentials(50) | me: %{id: "5511000000000:2@s.whatsapp.net"}}
+    local_pre_key = deterministic_key_pair(59)
+    local = %{local | pre_keys: %{7 => local_pre_key}}
+    remote = deterministic_credentials(60)
+
+    bundle = %{
+      registration_id: local.registration_id,
+      identity_key: <<5, local.signed_identity_key.public::binary>>,
+      signed_pre_key: %{
+        key_id: local.signed_pre_key.key_id,
+        public: <<5, local.signed_pre_key.key_pair.public::binary>>,
+        signature: local.signed_pre_key.signature
+      },
+      pre_key: %{key_id: 7, public: <<5, local_pre_key.public::binary>>}
+    }
+
+    {:ok, remote_record} = SessionBuilder.init_outgoing(nil, bundle, remote.signed_identity_key)
+    raw = Protobuf.encode(content)
+    plaintext = raw <> <<1>>
+
+    {:ok, :pkmsg, ciphertext, _remote_record} =
+      SessionCipher.encrypt(
+        remote_record,
+        plaintext,
+        remote.signed_identity_key,
+        remote.registration_id
+      )
+
+    attrs =
+      Map.merge(
+        %{
+          "id" => "incoming-integration-1",
+          "from" => "5521999999999@s.whatsapp.net",
+          "t" => "1700000000"
+        },
+        attrs
+      )
+
+    message = %Node{
+      tag: "message",
+      attrs: attrs,
+      content: [%Node{tag: "enc", attrs: %{"type" => "pkmsg"}, content: ciphertext}]
+    }
+
+    {local, message, raw}
   end
 
   defp deterministic_credentials(seed) do

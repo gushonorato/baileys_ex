@@ -407,6 +407,13 @@ defmodule BaileysExo.ConnectionProcess do
       case decrypt_message(node, state.credentials) do
         {:ok, envelope, credentials, protocol_response} ->
           with {:ok, state} <- acknowledge_message(credentials, protocol_response, state) do
+            upsert_type = if envelope.offline, do: :append, else: :notify
+
+            send(state.owner, {
+              :connection_event,
+              {:messages_upsert, [envelope], upsert_type, nil}
+            })
+
             projection =
               (envelope.content.deviceSentMessage && envelope.content.deviceSentMessage.message) ||
                 envelope.content

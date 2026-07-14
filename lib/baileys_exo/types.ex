@@ -108,6 +108,19 @@ defmodule Baileys.Message do
   ]
 end
 
+defmodule Baileys.MessagesUpsert do
+  @moduledoc "Batch of complete messages corresponding to Baileys `messages.upsert`."
+
+  @type t :: %__MODULE__{
+          messages: [Baileys.Message.t()],
+          type: :append | :notify,
+          request_id: String.t() | nil
+        }
+
+  @enforce_keys [:messages, :type]
+  defstruct [:messages, :type, :request_id]
+end
+
 defmodule Baileys.SentMessage do
   @moduledoc "Text message accepted by the WhatsApp transport."
 

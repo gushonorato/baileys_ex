@@ -11,6 +11,7 @@ defmodule BaileysExo.Client do
     Message,
     MessageKey,
     MessageStatus,
+    MessagesUpsert,
     QR,
     TextMessage
   }
@@ -244,6 +245,20 @@ defmodule BaileysExo.Client do
     }
 
     notify(state, {:text_message, message})
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:connection_event, {:messages_upsert, envelopes, type, request_id}},
+        state
+      ) do
+    upsert = %MessagesUpsert{
+      messages: Enum.map(envelopes, &public_message/1),
+      type: type,
+      request_id: request_id
+    }
+
+    notify(state, {:messages_upsert, upsert})
     {:noreply, state}
   end
 
