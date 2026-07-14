@@ -5,7 +5,12 @@ defmodule BaileysExo.Client do
 
   alias Baileys.{
     Account,
+    AccountSettings,
+    BlocklistUpdate,
+    Call,
     Connection,
+    ContactUpdate,
+    DefaultDisappearingMode,
     Disconnected,
     Error,
     GroupJoinRequest,
@@ -19,6 +24,9 @@ defmodule BaileysExo.Client do
     MessageReceiptUpdate,
     MessageStatus,
     MessageUpdate,
+    MediaRetryData,
+    MediaRetryError,
+    MediaUpdate,
     MessagesUpsert,
     QR,
     TextMessage,
@@ -242,6 +250,44 @@ defmodule BaileysExo.Client do
   def handle_info({:connection_event, {:paired, me}}, state) do
     notify(state, {:paired, %Account{jid: me.id, name: me[:name]}})
     {:noreply, %{state | status: :restarting}}
+  end
+
+  def handle_info({:connection_event, {:call, calls}}, state) do
+    notify(state, {:call, Enum.map(calls, &struct!(Call, &1))})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:contacts_update, updates}}, state) do
+    notify(state, {:contacts_update, Enum.map(updates, &struct!(ContactUpdate, &1))})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:blocklist_update, update}}, state) do
+    notify(state, {:blocklist_update, struct!(BlocklistUpdate, update)})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:settings_update, settings}}, state) do
+    mode =
+      case settings[:default_disappearing_mode] do
+        nil -> nil
+        mode -> struct!(DefaultDisappearingMode, mode)
+      end
+
+    notify(state, {:settings_update, %AccountSettings{default_disappearing_mode: mode}})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:messages_media_update, updates}}, state) do
+    updates =
+      Enum.map(updates, fn update ->
+        media = if update.media, do: struct!(MediaRetryData, update.media)
+        error = if update.error, do: struct!(MediaRetryError, update.error)
+        %MediaUpdate{key: public_key(update.key), media: media, error: error}
+      end)
+
+    notify(state, {:messages_media_update, updates})
+    {:noreply, state}
   end
 
   def handle_info({:connection_event, {:text_message, metadata, text}}, state) do

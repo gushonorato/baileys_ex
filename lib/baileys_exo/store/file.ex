@@ -15,6 +15,7 @@ defmodule BaileysExo.Store.File do
     :__struct__,
     :__unknown_fields__,
     :account,
+    :account_settings,
     :accountSignature,
     :accountSignatureKey,
     :adv_secret_key,
@@ -30,6 +31,9 @@ defmodule BaileysExo.Store.File do
     :details,
     :deviceSignature,
     :ephemeral_key_pair,
+    :ephemeral_expiration,
+    :ephemeral_setting_timestamp,
+    :default_disappearing_mode,
     :first_unuploaded_pre_key_id,
     :id,
     :index_info,
@@ -47,9 +51,11 @@ defmodule BaileysExo.Store.File do
     :pairing_code,
     :pairing_ephemeral_key,
     :pending_pre_key,
+    :pending_app_state_sync,
     :platform,
     :pre_key_id,
     :pre_keys,
+    :privacy_tokens,
     :previous_counter,
     :private,
     :public,
@@ -69,6 +75,8 @@ defmodule BaileysExo.Store.File do
     :signed_identity_key,
     :signed_key_id,
     :signed_pre_key,
+    :timestamp,
+    :token,
     :used
   ]
 

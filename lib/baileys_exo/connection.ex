@@ -7,11 +7,12 @@ defmodule BaileysExo.ConnectionProcess do
 
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.{Codec, Node, NodeUtils}
-  alias BaileysExo.{Crypto, Noise}
+  alias BaileysExo.{Calls, Crypto, Noise}
+  alias BaileysExo.JID
   alias BaileysExo.Protocol.Handshake
   alias BaileysExo.Protocol.{Pairing, USync}
   alias BaileysExo.Proto.Message
-  alias BaileysExo.Messages.{GroupNotification, Receiver, Sender}
+  alias BaileysExo.Messages.{GroupNotification, Notification, Receiver, Sender}
   alias BaileysExo.Signal.{SenderKey, SessionCipher}
   alias BaileysExo.Signal.PreKeys
   alias BaileysExo.Store.File, as: FileStore
@@ -21,6 +22,15 @@ defmodule BaileysExo.ConnectionProcess do
   @default_max_retry_requesters 16
   @default_incoming_retry_budget 100
   @default_max_persisted_pre_keys PreKeys.initial_count() + @default_incoming_retry_budget
+  @default_call_offer_limit 100
+  @default_call_offer_ttl 300_000
+  @app_state_collections [
+    "critical_block",
+    "critical_unblock_low",
+    "regular_high",
+    "regular_low",
+    "regular"
+  ]
   @default_sent_message_bytes 1_048_576
   @default_sent_message_limit 100
 
@@ -44,8 +54,8 @@ defmodule BaileysExo.ConnectionProcess do
     GenServer.call(connection, {:relay, node, retry_material}, 30_000)
   end
 
-  def commit_credentials(connection, credentials) do
-    GenServer.call(connection, {:commit_credentials, credentials}, 30_000)
+  def commit_credentials(connection, base, credentials) do
+    GenServer.call(connection, {:commit_credentials, base, credentials}, 30_000)
   end
 
   @doc false
@@ -127,6 +137,10 @@ defmodule BaileysExo.ConnectionProcess do
              Keyword.get(options, :incoming_retry_limit, @default_sent_message_limit),
            incoming_retry_budget:
              Keyword.get(options, :incoming_retry_budget, @default_incoming_retry_budget),
+           call_offers: %{},
+           call_offer_order: [],
+           call_offer_limit: Keyword.get(options, :call_offer_limit, @default_call_offer_limit),
+           call_offer_ttl: Keyword.get(options, :call_offer_ttl, @default_call_offer_ttl),
            max_retry_requesters:
              Keyword.get(options, :max_retry_requesters, @default_max_retry_requesters),
            session_path: Keyword.get(options, :session_path)
@@ -201,6 +215,14 @@ defmodule BaileysExo.ConnectionProcess do
       {{:external, from, _timer}, pending} ->
         GenServer.reply(from, {:error, :timeout})
         {:noreply, %{state | pending_queries: pending}}
+
+      {{:prekeys_replenish, _credentials, _last_id, notification, attempt, _timer}, pending} ->
+        state = %{state | pending_queries: pending}
+
+        case retry_prekey_replenishment(notification, attempt, state) do
+          {:ok, state} -> {:noreply, state}
+          {:error, reason} -> stop_with_error(reason, state)
+        end
 
       {{_kind, _credentials, _metadata, _timer}, pending} ->
         stop_with_error({:query_timeout, id}, %{state | pending_queries: pending})
@@ -277,14 +299,14 @@ defmodule BaileysExo.ConnectionProcess do
     {:reply, {:error, :not_connected}, state}
   end
 
-  def handle_call({:commit_credentials, credentials}, _from, state) do
-    case persist_credentials(state.session_path, credentials) do
-      :ok ->
-        send(state.owner, {:connection_event, {:credentials, credentials}})
-        {:reply, :ok, %{state | credentials: credentials}}
-
-      {:error, reason} ->
-        {:reply, {:error, {:store, reason}}, state}
+  def handle_call({:commit_credentials, base, credentials}, _from, state) do
+    with {:ok, credentials} <- merge_sender_credentials(state.credentials, base, credentials),
+         :ok <- persist_credentials(state.session_path, credentials) do
+      send(state.owner, {:connection_event, {:credentials, credentials}})
+      {:reply, {:ok, credentials}, %{state | credentials: credentials}}
+    else
+      {:error, :credentials_conflict} = error -> {:reply, error, state}
+      {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
     end
   end
 
@@ -391,6 +413,29 @@ defmodule BaileysExo.ConnectionProcess do
           {:error, {:prekey_upload_failed, node}}
         end
 
+      {{:prekeys_replenish, credentials, last_id, notification, attempt, timer}, pending} ->
+        Process.cancel_timer(timer)
+
+        if type == "result" do
+          credentials = %{
+            state.credentials
+            | first_unuploaded_pre_key_id: last_id + 1,
+              next_pre_key_id: max(state.credentials.next_pre_key_id, credentials.next_pre_key_id)
+          }
+
+          with :ok <- persist_credentials(state.session_path, credentials) do
+            send(state.owner, {:connection_event, {:credentials, credentials}})
+
+            send_node(Receiver.ack(notification, credentials), %{
+              state
+              | credentials: credentials,
+                pending_queries: pending
+            })
+          end
+        else
+          retry_prekey_replenishment(notification, attempt, %{state | pending_queries: pending})
+        end
+
       {{:pairing_finish, credentials, timer}, pending} ->
         Process.cancel_timer(timer)
 
@@ -480,7 +525,7 @@ defmodule BaileysExo.ConnectionProcess do
   defp handle_node(%Node{tag: "receipt"} = node, state), do: handle_receipt(node, state)
 
   defp handle_node(%Node{tag: "call"} = node, state) do
-    process_and_ack(node, state, fn -> {:ok, state} end)
+    process_and_ack(node, state, fn -> process_call(node, state) end)
   end
 
   defp handle_node(%Node{tag: "ib"} = node, state) do
@@ -533,6 +578,18 @@ defmodule BaileysExo.ConnectionProcess do
             {:ok, state}
         end
 
+      node.attrs["type"] in ["picture", "account_sync", "mediaretry", "privacy_token"] ->
+        process_external_notification(node, state)
+
+      node.attrs["type"] == "devices" ->
+        process_devices_notification(node, state)
+
+      node.attrs["type"] == "encrypt" ->
+        process_encrypt_notification(node, state)
+
+      node.attrs["type"] == "server_sync" ->
+        process_server_sync_notification(node, state)
+
       NodeUtils.child(node, "link_code_companion_reg") ->
         with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
              :ok <- persist_credentials(state.session_path, credentials),
@@ -549,6 +606,352 @@ defmodule BaileysExo.ConnectionProcess do
         {:ok, state}
     end
   end
+
+  defp process_external_notification(node, state) do
+    case Notification.decode(node, state.credentials) do
+      {:ok, effects, credentials} ->
+        with {:ok, state} <- maybe_commit_credentials(credentials, state) do
+          Enum.each(effects, &emit_notification_effect(&1, state.owner))
+          {:ok, state}
+        end
+
+      {:error, _reason} ->
+        {:ok, state}
+    end
+  end
+
+  defp emit_notification_effect({:messages_upsert, messages, type, request_id}, owner) do
+    send(owner, {:connection_event, {:messages_upsert, messages, type, request_id}})
+  end
+
+  defp emit_notification_effect({:media_update, updates}, owner) do
+    send(owner, {:connection_event, {:messages_media_update, updates}})
+  end
+
+  defp emit_notification_effect({type, payload}, owner) do
+    send(owner, {:connection_event, {type, payload}})
+  end
+
+  defp process_devices_notification(node, state) do
+    case first_node_child(node) do
+      %Node{tag: "remove"} = operation ->
+        device_jids =
+          operation
+          |> NodeUtils.children("device")
+          |> Enum.map(& &1.attrs["jid"])
+          |> Enum.filter(&(is_binary(&1) and &1 != ""))
+
+        update_credentials(state, fn credentials ->
+          addresses = Enum.flat_map(device_jids, &session_aliases(credentials, &1))
+          %{credentials | sessions: Map.drop(credentials.sessions, addresses)}
+        end)
+
+      %Node{tag: tag} when tag in ["add", "update"] ->
+        {:ok, state}
+
+      _unsupported ->
+        {:ok, state}
+    end
+  end
+
+  defp process_encrypt_notification(%Node{attrs: %{"from" => "s.whatsapp.net"}} = node, state) do
+    count =
+      case NodeUtils.child(node, "count") do
+        %Node{attrs: %{"value" => value}} -> parse_non_negative_integer(value)
+        _missing -> nil
+      end
+
+    cond do
+      not is_integer(count) or count >= 5 ->
+        {:ok, state}
+
+      prekey_replenishment_pending?(state) ->
+        {:ok, state}
+
+      true ->
+        case start_prekey_replenishment(node, 1, state) do
+          {:ok, state} -> {:defer_ack, state}
+          {:error, _reason} = error -> error
+        end
+    end
+  end
+
+  defp process_encrypt_notification(node, state) do
+    if not is_nil(NodeUtils.child(node, "identity")) and
+         peer_identity_change?(node, state.credentials) do
+      update_credentials(state, fn credentials ->
+        sessions =
+          Map.reject(credentials.sessions, fn {address, _record} ->
+            same_jid_account?(address, node.attrs["from"], credentials)
+          end)
+
+        %{credentials | sessions: sessions}
+      end)
+    else
+      {:ok, state}
+    end
+  end
+
+  defp process_server_sync_notification(node, state) do
+    case NodeUtils.child(node, "collection") do
+      %Node{attrs: %{"name" => name}} when name in @app_state_collections ->
+        update_credentials(state, fn credentials ->
+          pending = List.delete(credentials.pending_app_state_sync, name) ++ [name]
+          %{credentials | pending_app_state_sync: pending}
+        end)
+
+      _missing ->
+        {:ok, state}
+    end
+  end
+
+  defp update_credentials(state, update) do
+    credentials = update.(state.credentials)
+
+    maybe_commit_credentials(credentials, state)
+  end
+
+  defp maybe_commit_credentials(credentials, state) do
+    if credentials == state.credentials do
+      {:ok, state}
+    else
+      with :ok <- persist_credentials(Map.get(state, :session_path), credentials) do
+        send(state.owner, {:connection_event, {:credentials, credentials}})
+        {:ok, %{state | credentials: credentials}}
+      end
+    end
+  end
+
+  defp merge_sender_credentials(current, base, updated) do
+    allowed_fields = [:sessions, :lid_mappings]
+
+    base_static = base |> Map.from_struct() |> Map.drop(allowed_fields)
+    updated_static = updated |> Map.from_struct() |> Map.drop(allowed_fields)
+
+    if base_static == updated_static do
+      with {:ok, sessions} <-
+             merge_credential_map(current.sessions, base.sessions, updated.sessions),
+           {:ok, lid_mappings} <-
+             merge_credential_map(current.lid_mappings, base.lid_mappings, updated.lid_mappings) do
+        {:ok, %{current | sessions: sessions, lid_mappings: lid_mappings}}
+      end
+    else
+      {:error, :credentials_conflict}
+    end
+  end
+
+  defp merge_credential_map(current, base, updated) do
+    changed_keys =
+      base
+      |> Map.keys()
+      |> Kernel.++(Map.keys(updated))
+      |> Enum.uniq()
+      |> Enum.filter(&(Map.get(base, &1) != Map.get(updated, &1)))
+
+    Enum.reduce_while(changed_keys, {:ok, current}, fn key, {:ok, merged} ->
+      base_value = Map.get(base, key)
+
+      if Map.get(current, key) == base_value do
+        merged =
+          if Map.has_key?(updated, key),
+            do: Map.put(merged, key, Map.fetch!(updated, key)),
+            else: Map.delete(merged, key)
+
+        {:cont, {:ok, merged}}
+      else
+        {:halt, {:error, :credentials_conflict}}
+      end
+    end)
+  end
+
+  defp first_node_child(%Node{content: content}) when is_list(content),
+    do: Enum.find(content, &match?(%Node{}, &1))
+
+  defp first_node_child(_node), do: nil
+
+  defp prekey_replenishment_pending?(state) do
+    state
+    |> Map.get(:pending_queries, %{})
+    |> Map.values()
+    |> Enum.any?(
+      &match?(
+        {:prekeys_replenish, _credentials, _last_id, _notification, _attempt, _timer},
+        &1
+      )
+    )
+  end
+
+  defp start_prekey_replenishment(notification, attempt, state) do
+    {credentials, upload, last_id} = PreKeys.upload_node(state.credentials, 5)
+
+    with :ok <- persist_credentials(state.session_path, credentials),
+         {:ok, state} <-
+           track_internal_query(
+             upload,
+             {:prekeys_replenish, credentials, last_id, notification, attempt},
+             %{state | credentials: credentials}
+           ) do
+      send(state.owner, {:connection_event, {:credentials, credentials}})
+      {:ok, state}
+    end
+  end
+
+  defp retry_prekey_replenishment(notification, attempt, state) when attempt < 3 do
+    start_prekey_replenishment(notification, attempt + 1, state)
+  end
+
+  defp retry_prekey_replenishment(notification, _attempt, state) do
+    send(state.owner, {:connection_event, {:error, :prekey_replenishment_failed}})
+    send_node(Receiver.ack(notification, state.credentials), state)
+  end
+
+  defp same_jid_user?(left, right) when is_binary(left) and is_binary(right) do
+    with {:ok, left} <- JID.decode(left),
+         {:ok, right} <- JID.decode(right) do
+      left.user == right.user and left.server == right.server
+    else
+      _invalid -> false
+    end
+  end
+
+  defp same_jid_user?(_left, _right), do: false
+
+  defp same_jid_account?(address, jid, credentials) do
+    credentials
+    |> session_aliases(jid)
+    |> Enum.any?(&same_jid_user?(address, &1))
+  end
+
+  defp session_aliases(credentials, jid) do
+    case JID.decode(jid) do
+      {:ok, decoded} ->
+        bare = JID.encode(decoded.user, decoded.server)
+
+        mapped =
+          case credentials.lid_mappings[bare] do
+            nil -> []
+            mapped -> [with_device(mapped, decoded.device)]
+          end
+
+        reverse =
+          credentials.lid_mappings
+          |> Enum.filter(fn {_pn, lid} -> same_jid_user?(lid, bare) end)
+          |> Enum.map(fn {pn, _lid} -> with_device(pn, decoded.device) end)
+
+        Enum.uniq([jid | mapped ++ reverse])
+
+      {:error, :invalid_jid} ->
+        [jid]
+    end
+  end
+
+  defp with_device(jid, device) do
+    case JID.decode(jid) do
+      {:ok, decoded} -> JID.encode(decoded.user, decoded.server, device)
+      {:error, :invalid_jid} -> jid
+    end
+  end
+
+  defp peer_identity_change?(node, credentials) do
+    from = node.attrs["from"]
+    me = credentials.me || %{}
+
+    with false <- Map.has_key?(node.attrs, "offline"),
+         {:ok, decoded} <- JID.decode(from),
+         true <- decoded.device in [nil, 0],
+         false <- same_jid_user?(from, me[:id]),
+         false <- same_jid_user?(from, me[:lid]) do
+      true
+    else
+      _ignored -> false
+    end
+  end
+
+  defp parse_non_negative_integer(value) do
+    case Integer.parse(value || "") do
+      {integer, ""} when integer >= 0 -> integer
+      _invalid -> nil
+    end
+  end
+
+  defp process_call(node, state) do
+    case Calls.decode(node, receipt_clock(state)) do
+      {:ok, call} ->
+        {call, state} = enrich_call_from_offer(call, state)
+        send(state.owner, {:connection_event, {:call, [call]}})
+        {:ok, state}
+
+      {:error, _reason} ->
+        {:ok, state}
+    end
+  end
+
+  defp enrich_call_from_offer(call, state) do
+    now = call_cache_clock(state).()
+    {offers, order} = prune_call_offers(state, now)
+    cached = offers[call.id]
+
+    call =
+      if cached do
+        call
+        |> Map.put(:from, call.from || cached.from)
+        |> Map.put(:caller_pn, call.caller_pn || cached.caller_pn)
+        |> Map.put(:is_video?, cached.is_video?)
+        |> Map.put(:is_group?, cached.is_group?)
+        |> Map.put(:group_jid, call.group_jid || cached.group_jid)
+      else
+        call
+      end
+
+    {offers, order} =
+      cond do
+        Calls.offer?(call) ->
+          order = List.delete(order, call.id) ++ [call.id]
+          offers = Map.put(offers, call.id, Map.put(call, :expires_at, call_expiry(state, now)))
+          trim_call_offers(offers, order, state)
+
+        Calls.terminal?(call) ->
+          {Map.delete(offers, call.id), List.delete(order, call.id)}
+
+        true ->
+          {offers, order}
+      end
+
+    state =
+      state
+      |> Map.put(:call_offers, offers)
+      |> Map.put(:call_offer_order, order)
+
+    {call, state}
+  end
+
+  defp prune_call_offers(state, now) do
+    offers = Map.get(state, :call_offers, %{})
+
+    order =
+      state
+      |> Map.get(:call_offer_order, [])
+      |> Enum.filter(fn id ->
+        case offers[id] do
+          %{expires_at: expires_at} -> expires_at > now
+          _missing -> false
+        end
+      end)
+
+    {Map.take(offers, order), order}
+  end
+
+  defp trim_call_offers(offers, order, state) do
+    limit = Map.get(state, :call_offer_limit, @default_call_offer_limit)
+    {expired, order} = Enum.split(order, max(length(order) - limit, 0))
+    {Map.drop(offers, expired), order}
+  end
+
+  defp call_expiry(state, now),
+    do: now + Map.get(state, :call_offer_ttl, @default_call_offer_ttl)
+
+  defp call_cache_clock(state),
+    do: Map.get(state, :monotonic_now, fn -> System.monotonic_time(:millisecond) end)
 
   defp handle_ib_node(node, state) do
     case NodeUtils.child(node, "edge_routing") do
@@ -572,8 +975,18 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp finish_login(state) do
-    if state.credentials.first_unuploaded_pre_key_id == 1 do
-      {credentials, node, last_id} = PreKeys.upload_node(state.credentials)
+    first = state.credentials.first_unuploaded_pre_key_id
+    next = state.credentials.next_pre_key_id
+
+    count =
+      cond do
+        first == 1 -> PreKeys.initial_count()
+        first < next -> next - first
+        true -> 0
+      end
+
+    if count > 0 do
+      {credentials, node, last_id} = PreKeys.upload_node(state.credentials, count)
 
       with :ok <- persist_credentials(state.session_path, credentials),
            {:ok, state} <-
@@ -616,8 +1029,14 @@ defmodule BaileysExo.ConnectionProcess do
 
       pending_entry =
         case kind do
-          {:prekeys, credentials, last_id} -> {:prekeys, credentials, last_id, timer}
-          {:pairing_finish, credentials} -> {:pairing_finish, credentials, timer}
+          {:prekeys, credentials, last_id} ->
+            {:prekeys, credentials, last_id, timer}
+
+          {:prekeys_replenish, credentials, last_id, notification, attempt} ->
+            {:prekeys_replenish, credentials, last_id, notification, attempt, timer}
+
+          {:pairing_finish, credentials} ->
+            {:pairing_finish, credentials, timer}
         end
 
       {:ok, %{state | pending_queries: Map.put(state.pending_queries, id, pending_entry)}}
@@ -1139,6 +1558,9 @@ defmodule BaileysExo.ConnectionProcess do
     case result do
       {:ok, updated_state} ->
         send_node(Receiver.ack(node, updated_state.credentials), updated_state)
+
+      {:defer_ack, updated_state} ->
+        {:ok, updated_state}
 
       {:error, reason} ->
         case send_node(Receiver.ack(node, state.credentials), state) do

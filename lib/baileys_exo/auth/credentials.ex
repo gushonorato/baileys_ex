@@ -24,7 +24,10 @@ defmodule BaileysExo.Auth.Credentials do
     sessions: %{},
     sender_keys: %{},
     pre_keys: %{},
-    lid_mappings: %{}
+    lid_mappings: %{},
+    account_settings: %{},
+    privacy_tokens: %{},
+    pending_app_state_sync: []
   ]
 
   def new do

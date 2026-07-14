@@ -1,7 +1,8 @@
 defmodule BaileysExo.Messages.SenderTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Binary.NodeUtils
+  alias BaileysExo.Auth.Credentials
+  alias BaileysExo.Binary.{Node, NodeUtils}
   alias BaileysExo.Messages.Sender
 
   test "direct message relay does not put phash on the outer stanza" do
@@ -24,5 +25,24 @@ defmodule BaileysExo.Messages.SenderTest do
            }
 
     assert %{} = NodeUtils.child(stanza, "participants")
+  end
+
+  test "attaches a current privacy token using PN to LID mapping" do
+    timestamp = System.system_time(:second)
+
+    credentials = %Credentials{
+      lid_mappings: %{"5511999999999@s.whatsapp.net" => "9000@lid"},
+      privacy_tokens: %{"9000@lid" => %{token: <<9, 8, 7>>, timestamp: timestamp}}
+    }
+
+    stanza = %Node{tag: "message", content: [%Node{tag: "participants"}]}
+
+    stanza =
+      Sender.attach_privacy_token(stanza, "5511999999999@s.whatsapp.net", credentials)
+
+    assert %Node{attrs: %{"t" => encoded_timestamp}, content: <<9, 8, 7>>} =
+             NodeUtils.child(stanza, "tctoken")
+
+    assert encoded_timestamp == Integer.to_string(timestamp)
   end
 end

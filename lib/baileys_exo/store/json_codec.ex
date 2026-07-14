@@ -5,7 +5,7 @@ defmodule BaileysExo.Store.JSONCodec do
   alias BaileysExo.Proto.{ADVSignedDeviceIdentity, SenderKeyRecordStructure}
   alias BaileysExo.Signal.SenderKey
 
-  @version 2
+  @version 3
 
   def encode(%Credentials{} = credentials) do
     Jason.encode(%{
@@ -30,7 +30,9 @@ defmodule BaileysExo.Store.JSONCodec do
     _error -> {:error, :invalid_credentials}
   end
 
-  defp validate_version(%{"version" => version}) when version in [1, @version], do: {:ok, version}
+  defp validate_version(%{"version" => version}) when version in [1, 2, @version],
+    do: {:ok, version}
+
   defp validate_version(%{"version" => _version}), do: {:error, :unsupported_session_version}
   defp validate_version(_document), do: {:error, :invalid_credentials}
 
@@ -53,7 +55,10 @@ defmodule BaileysExo.Store.JSONCodec do
       "sessions" => Map.new(credentials.sessions, &encode_session_record_entry/1),
       "sender_keys" => Map.new(credentials.sender_keys, &encode_sender_key_entry/1),
       "pre_keys" => Map.new(credentials.pre_keys, &encode_pre_key_entry/1),
-      "lid_mappings" => credentials.lid_mappings
+      "lid_mappings" => credentials.lid_mappings,
+      "account_settings" => encode_account_settings(credentials.account_settings),
+      "privacy_tokens" => Map.new(credentials.privacy_tokens, &encode_privacy_token/1),
+      "pending_app_state_sync" => credentials.pending_app_state_sync
     }
   end
 
@@ -76,7 +81,10 @@ defmodule BaileysExo.Store.JSONCodec do
          {:ok, sessions} <- decode_sessions(value["sessions"]),
          {:ok, sender_keys} <- decode_sender_keys(value, version),
          {:ok, pre_keys} <- decode_pre_keys(value["pre_keys"]),
-         {:ok, lid_mappings} <- decode_string_map(value["lid_mappings"]) do
+         {:ok, lid_mappings} <- decode_string_map(value["lid_mappings"]),
+         {:ok, account_settings} <- decode_account_settings(value, version),
+         {:ok, privacy_tokens} <- decode_privacy_tokens(value, version),
+         {:ok, pending_app_state_sync} <- decode_pending_app_state_sync(value, version) do
       {:ok,
        %Credentials{
          noise_key: noise_key,
@@ -96,7 +104,10 @@ defmodule BaileysExo.Store.JSONCodec do
          sessions: sessions,
          sender_keys: sender_keys,
          pre_keys: pre_keys,
-         lid_mappings: lid_mappings
+         lid_mappings: lid_mappings,
+         account_settings: account_settings,
+         privacy_tokens: privacy_tokens,
+         pending_app_state_sync: pending_app_state_sync
        }}
     end
   end
@@ -110,7 +121,8 @@ defmodule BaileysExo.Store.JSONCodec do
 
   defp decode_sender_keys(_value, 1), do: {:ok, %{}}
 
-  defp decode_sender_keys(%{"sender_keys" => value}, @version) when is_map(value) do
+  defp decode_sender_keys(%{"sender_keys" => value}, version)
+       when version in [2, @version] and is_map(value) do
     decode_map(value, fn address, encoded ->
       with true <- is_binary(address),
            {:ok, encoded} <- decode_binary(encoded),
@@ -122,7 +134,88 @@ defmodule BaileysExo.Store.JSONCodec do
     end)
   end
 
-  defp decode_sender_keys(_value, @version), do: {:error, :invalid_credentials}
+  defp decode_sender_keys(_value, version) when version in [2, @version],
+    do: {:error, :invalid_credentials}
+
+  defp encode_account_settings(settings) do
+    case settings[:default_disappearing_mode] do
+      nil ->
+        %{}
+
+      mode ->
+        %{
+          "default_disappearing_mode" => %{
+            "ephemeral_expiration" => mode.ephemeral_expiration,
+            "ephemeral_setting_timestamp" => mode.ephemeral_setting_timestamp
+          }
+        }
+    end
+  end
+
+  defp decode_account_settings(_value, version) when version in [1, 2], do: {:ok, %{}}
+
+  defp decode_account_settings(%{"account_settings" => settings}, @version)
+       when is_map(settings) do
+    case settings["default_disappearing_mode"] do
+      nil ->
+        {:ok, %{}}
+
+      %{
+        "ephemeral_expiration" => expiration,
+        "ephemeral_setting_timestamp" => timestamp
+      }
+      when is_integer(expiration) and expiration >= 0 and is_integer(timestamp) and timestamp >= 0 ->
+        {:ok,
+         %{
+           default_disappearing_mode: %{
+             ephemeral_expiration: expiration,
+             ephemeral_setting_timestamp: timestamp
+           }
+         }}
+
+      _invalid ->
+        {:error, :invalid_credentials}
+    end
+  end
+
+  defp decode_account_settings(_value, @version), do: {:error, :invalid_credentials}
+
+  defp encode_privacy_token({jid, %{token: token, timestamp: timestamp}}) do
+    {jid, %{"token" => encode_binary(token), "timestamp" => timestamp}}
+  end
+
+  defp decode_privacy_tokens(_value, version) when version in [1, 2], do: {:ok, %{}}
+
+  defp decode_privacy_tokens(%{"privacy_tokens" => tokens}, @version) when is_map(tokens) do
+    decode_map(tokens, fn jid, value ->
+      with true <- is_binary(jid) and jid != "",
+           %{"token" => token, "timestamp" => timestamp} <- value,
+           {:ok, token} <- decode_binary(token),
+           true <- is_integer(timestamp) and timestamp >= 0 do
+        {:ok, jid, %{token: token, timestamp: timestamp}}
+      else
+        _invalid -> {:error, :invalid_credentials}
+      end
+    end)
+  end
+
+  defp decode_privacy_tokens(_value, @version), do: {:error, :invalid_credentials}
+
+  defp decode_pending_app_state_sync(_value, version) when version in [1, 2], do: {:ok, []}
+
+  defp decode_pending_app_state_sync(%{"pending_app_state_sync" => collections}, @version)
+       when is_list(collections) do
+    allowed = ["critical_block", "critical_unblock_low", "regular_high", "regular_low", "regular"]
+
+    if Enum.all?(collections, &(&1 in allowed)) and
+         length(Enum.uniq(collections)) == length(collections) do
+      {:ok, collections}
+    else
+      {:error, :invalid_credentials}
+    end
+  end
+
+  defp decode_pending_app_state_sync(_value, @version), do: {:error, :invalid_credentials}
 
   defp encode_key_pair(%{public: public, private: private}) do
     %{"public" => encode_binary(public), "private" => encode_binary(private)}

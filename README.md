@@ -62,8 +62,9 @@ calling the callback process itself.
 `sessions_path` is required and must be absolute. Credentials, prekeys, direct
 Signal sessions and group sender-key records are persisted as
 `<sessions_path>/<session>.json` using a versioned schema and Base64 for binary
-fields. Schema v2 adds sender-key storage; schema v1 JSON and files from the
-previous `<sessions_path>/<session>/session.json` layout and legacy
+fields. Schema v2 adds sender-key storage and schema v3 adds non-secret account
+settings, privacy tokens and pending app-state collections; schema v1/v2 JSON and files from the previous
+`<sessions_path>/<session>/session.json` layout and legacy
 `session.etf` files are safely migrated on first load. The directory and file
 modes are `0700` and `0600`. Do not run two clients against the same session.
 Base64 is an encoding, not encryption; the JSON file contains secrets and must
@@ -171,10 +172,15 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :connection, data: %Baileys.Connection{}}
 %Baileys.Event{client: client, type: :qr, data: %Baileys.QR{}}
 %Baileys.Event{client: client, type: :paired, data: %Baileys.Account{}}
+%Baileys.Event{client: client, type: :call, data: [%Baileys.Call{}]}
 %Baileys.Event{client: client, type: :messages_upsert, data: %Baileys.MessagesUpsert{}}
 %Baileys.Event{client: client, type: :messages_update, data: [%Baileys.MessageUpdate{}]}
 %Baileys.Event{client: client, type: :messages_reaction, data: [%Baileys.MessageReaction{}]}
+%Baileys.Event{client: client, type: :messages_media_update, data: [%Baileys.MediaUpdate{}]}
 %Baileys.Event{client: client, type: :message_receipt_update, data: [%Baileys.MessageReceiptUpdate{}]}
+%Baileys.Event{client: client, type: :contacts_update, data: [%Baileys.ContactUpdate{}]}
+%Baileys.Event{client: client, type: :blocklist_update, data: %Baileys.BlocklistUpdate{}}
+%Baileys.Event{client: client, type: :settings_update, data: %Baileys.AccountSettings{}}
 %Baileys.Event{client: client, type: :groups_upsert, data: [%Baileys.GroupMetadata{}]}
 %Baileys.Event{client: client, type: :groups_update, data: [%Baileys.GroupUpdate{}]}
 %Baileys.Event{client: client, type: :group_participants_update, data: %Baileys.GroupParticipantsUpdate{}}
@@ -215,10 +221,19 @@ participant changes, subject, description, settings, invite links and
 membership approval operations also emit the typed events listed above after
 their system-message upsert.
 
-Calls and history synchronization are not yet exposed as complete public
-events. Incoming calls and unsupported notifications are still acknowledged at
-the protocol layer so they do not remain pending; unsupported operations are
-discarded without terminating the connection.
+Call stanzas emit ordered one-element `:call` batches. Offer metadata is retained
+for at most five minutes and 100 calls, then carried into ringing and terminal
+events. Unknown or malformed call payloads are discarded but still ACKed.
+
+Picture, account-sync blocklist/default-disappearing-mode and media-retry
+notifications emit the typed events listed above. Device-list changes, peer
+identity changes and low-prekey notifications are internal-only because they
+maintain Signal state; low-prekey handling emits no public secret material.
+Trusted-contact privacy tokens are persisted internally and attached to eligible
+1:1 sends while current. Server-sync collection names are validated and persisted
+for the history/app-state synchronization layer. Every recognized category is
+ACKed exactly once, including malformed payloads. History synchronization itself
+is not yet exposed as a complete public event.
 
 ## Lifecycle
 

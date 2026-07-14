@@ -234,31 +234,256 @@ defmodule BaileysExo.ConnectionProcessTest do
                      }}}
   end
 
-  test "acknowledges an unsupported notification without a public event", %{state: state} do
-    notification = %Node{
-      tag: "notification",
-      attrs: %{
-        "id" => "notification-1",
-        "from" => "s.whatsapp.net",
-        "type" => "devices"
+  test "acknowledges every recognized malformed notification category once", %{state: state} do
+    for type <- [
+          "picture",
+          "account_sync",
+          "mediaretry",
+          "devices",
+          "encrypt",
+          "server_sync",
+          "privacy_token"
+        ] do
+      notification = %Node{
+        tag: "notification",
+        attrs: %{
+          "id" => "notification-#{type}",
+          "from" => "s.whatsapp.net",
+          "type" => type
+        }
       }
-    }
 
-    assert {:ok, ^state} = ConnectionProcess.dispatch(notification, state)
+      assert {:ok, ^state} = ConnectionProcess.dispatch(notification, state)
 
-    assert_receive {:sent_node,
-                    %Node{
-                      tag: "ack",
-                      attrs: %{
-                        "class" => "notification",
-                        "id" => "notification-1",
-                        "to" => "s.whatsapp.net",
-                        "type" => "devices"
-                      }
-                    }}
+      assert_receive {:sent_node,
+                      %Node{
+                        tag: "ack",
+                        attrs: %{
+                          "class" => "notification",
+                          "id" => "notification-" <> ^type,
+                          "to" => "s.whatsapp.net",
+                          "type" => ^type
+                        }
+                      }}
+
+      refute_receive {:sent_node, %Node{tag: "ack"}}
+    end
 
     refute_receive {:connection_event, _event}
+  end
+
+  test "routes public notification effects before acknowledging", %{state: state} do
+    picture = %Node{
+      tag: "notification",
+      attrs: %{
+        "id" => "picture-1",
+        "from" => "contact@s.whatsapp.net",
+        "type" => "picture"
+      },
+      content: [%Node{tag: "set", attrs: %{"id" => "hash"}}]
+    }
+
+    state = Map.put(state, :session_path, nil)
+    assert {:ok, ^state} = ConnectionProcess.dispatch(picture, state)
+
+    assert_receive {:connection_event,
+                    {:contacts_update, [%{id: "contact@s.whatsapp.net", img_url: :changed}]}}
+
+    assert_receive {:sent_node,
+                    %Node{tag: "ack", attrs: %{"id" => "picture-1", "type" => "picture"}}}
+  end
+
+  test "removes device and changed-identity sessions internally", %{state: state} do
+    credentials = %{
+      state.credentials
+      | sessions: %{
+          "contact:1@s.whatsapp.net" => %{record: 1},
+          "contact:2@s.whatsapp.net" => %{record: 2},
+          "9000:2@lid" => %{record: 4},
+          "9000:3@lid" => %{record: 5},
+          "other:1@s.whatsapp.net" => %{record: 3}
+        },
+        lid_mappings: %{"contact@s.whatsapp.net" => "9000@lid"}
+    }
+
+    remove = %Node{
+      tag: "notification",
+      attrs: %{"id" => "devices-1", "from" => "contact@s.whatsapp.net", "type" => "devices"},
+      content: [
+        %Node{
+          tag: "remove",
+          content: [%Node{tag: "device", attrs: %{"jid" => "contact:2@s.whatsapp.net"}}]
+        }
+      ]
+    }
+
+    state = state |> Map.put(:credentials, credentials) |> Map.put(:session_path, nil)
+    assert {:ok, state} = ConnectionProcess.dispatch(remove, state)
+    refute Map.has_key?(state.credentials.sessions, "contact:2@s.whatsapp.net")
+    refute Map.has_key?(state.credentials.sessions, "9000:2@lid")
+    assert Map.has_key?(state.credentials.sessions, "contact:1@s.whatsapp.net")
+    assert_receive {:connection_event, {:credentials, _credentials}}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "devices-1"}}}
+
+    identity = %Node{
+      tag: "notification",
+      attrs: %{"id" => "identity-1", "from" => "contact@s.whatsapp.net", "type" => "encrypt"},
+      content: [%Node{tag: "identity"}]
+    }
+
+    assert {:ok, state} = ConnectionProcess.dispatch(identity, state)
+    refute Map.has_key?(state.credentials.sessions, "contact:1@s.whatsapp.net")
+    refute Map.has_key?(state.credentials.sessions, "9000:3@lid")
+    assert Map.has_key?(state.credentials.sessions, "other:1@s.whatsapp.net")
+    assert_receive {:connection_event, {:credentials, _credentials}}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "identity-1"}}}
+  end
+
+  test "replenishes low prekeys before acknowledging the notification", %{state: state} do
+    notification = %Node{
+      tag: "notification",
+      attrs: %{"id" => "prekey-low-1", "from" => "s.whatsapp.net", "type" => "encrypt"},
+      content: [%Node{tag: "count", attrs: %{"value" => "2"}}]
+    }
+
+    state =
+      state
+      |> Map.put(:credentials, deterministic_credentials(50))
+      |> Map.put(:pending_queries, %{})
+      |> Map.put(:session_path, nil)
+
+    assert {:ok, state} = ConnectionProcess.dispatch(notification, state)
+    assert map_size(state.pending_queries) == 1
+    assert map_size(state.credentials.pre_keys) == 5
+    assert_receive {:sent_node, %Node{tag: "iq", attrs: %{"xmlns" => "encrypt"}}}
+    assert_receive {:connection_event, {:credentials, %Credentials{}}}
     refute_receive {:sent_node, %Node{tag: "ack"}}
+
+    [query_id] = Map.keys(state.pending_queries)
+    reply = %Node{tag: "iq", attrs: %{"id" => query_id, "type" => "result"}}
+    assert {:ok, state} = ConnectionProcess.dispatch(reply, state)
+    assert state.credentials.first_unuploaded_pre_key_id == 6
+    assert_receive {:connection_event, {:credentials, %Credentials{}}}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "prekey-low-1"}}}
+  end
+
+  test "retries failed prekey replenishment before its single acknowledgement", %{state: state} do
+    notification = %Node{
+      tag: "notification",
+      attrs: %{"id" => "prekey-low-failed", "from" => "s.whatsapp.net", "type" => "encrypt"},
+      content: [%Node{tag: "count", attrs: %{"value" => "1"}}]
+    }
+
+    state =
+      state
+      |> Map.put(:credentials, deterministic_credentials(51))
+      |> Map.put(:pending_queries, %{})
+      |> Map.put(:session_path, nil)
+
+    assert {:ok, state} = ConnectionProcess.dispatch(notification, state)
+    assert_receive {:sent_node, %Node{tag: "iq"}}
+    assert_receive {:connection_event, {:credentials, %Credentials{}}}
+
+    state =
+      Enum.reduce(1..3, state, fn attempt, state ->
+        [query_id] = Map.keys(state.pending_queries)
+        reply = %Node{tag: "iq", attrs: %{"id" => query_id, "type" => "error"}}
+        assert {:ok, state} = ConnectionProcess.dispatch(reply, state)
+
+        if attempt < 3 do
+          assert_receive {:sent_node, %Node{tag: "iq"}}
+          assert_receive {:connection_event, {:credentials, %Credentials{}}}
+          refute_receive {:sent_node, %Node{tag: "ack"}}
+        end
+
+        state
+      end)
+
+    assert state.pending_queries == %{}
+    assert_receive {:connection_event, {:error, :prekey_replenishment_failed}}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "prekey-low-failed"}}}
+    refute_receive {:sent_node, %Node{tag: "ack"}}
+  end
+
+  test "merges sender credential deltas without overwriting concurrent state", %{state: state} do
+    base = %{
+      deterministic_credentials(60)
+      | sessions: %{"contact:1@s.whatsapp.net" => %{ratchet: :base}}
+    }
+
+    updated = %{
+      base
+      | sessions: %{"contact:1@s.whatsapp.net" => %{ratchet: :sender}},
+        lid_mappings: %{"contact@s.whatsapp.net" => "9000@lid"}
+    }
+
+    current = %{
+      base
+      | account_settings: %{
+          default_disappearing_mode: %{
+            ephemeral_expiration: 86_400,
+            ephemeral_setting_timestamp: 1_700_000_000
+          }
+        }
+    }
+
+    state = state |> Map.put(:credentials, current) |> Map.put(:session_path, nil)
+
+    assert {:reply, {:ok, merged}, state} =
+             ConnectionProcess.handle_call(
+               {:commit_credentials, base, updated},
+               self(),
+               state
+             )
+
+    assert merged.sessions["contact:1@s.whatsapp.net"] == %{ratchet: :sender}
+    assert merged.account_settings == current.account_settings
+    assert merged.lid_mappings == updated.lid_mappings
+    assert_receive {:connection_event, {:credentials, ^merged}}
+
+    conflicted = put_in(current.sessions["contact:1@s.whatsapp.net"], %{ratchet: :receiver})
+    state = %{state | credentials: conflicted}
+
+    assert {:reply, {:error, :credentials_conflict}, ^state} =
+             ConnectionProcess.handle_call(
+               {:commit_credentials, base, updated},
+               self(),
+               state
+             )
+  end
+
+  test "persists validated server-sync collections for app-state processing", %{state: state} do
+    state = Map.put(state, :session_path, nil)
+
+    state =
+      Enum.reduce(
+        ["critical_block", "critical_unblock_low", "regular_high", "regular_low", "regular"],
+        state,
+        fn name, state ->
+          notification = %Node{
+            tag: "notification",
+            attrs: %{
+              "id" => "sync-#{name}",
+              "from" => "s.whatsapp.net",
+              "type" => "server_sync"
+            },
+            content: [%Node{tag: "collection", attrs: %{"name" => name}}]
+          }
+
+          assert {:ok, state} = ConnectionProcess.dispatch(notification, state)
+          assert_receive {:connection_event, {:credentials, %Credentials{}}}
+          assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "sync-" <> _}}}
+          state
+        end
+      )
+
+    assert state.credentials.pending_app_state_sync == [
+             "critical_block",
+             "critical_unblock_low",
+             "regular_high",
+             "regular_low",
+             "regular"
+           ]
   end
 
   test "finishes pairing-code registration and acknowledges its notification once", %{
@@ -335,25 +560,122 @@ defmodule BaileysExo.ConnectionProcessTest do
     refute_receive {:sent_node, %Node{tag: "ack"}}
   end
 
-  test "acknowledges call stanzas without exposing them", %{state: state} do
+  test "emits typed calls, carries bounded offer metadata and acknowledges once", %{state: state} do
     call = %Node{
       tag: "call",
-      attrs: %{"id" => "call-1", "from" => "5521999999999@s.whatsapp.net"}
+      attrs: %{
+        "id" => "call-stanza-1",
+        "from" => "fixture-group@g.us",
+        "t" => "1700000000"
+      },
+      content: [
+        %Node{
+          tag: "offer",
+          attrs: %{
+            "call-id" => "call-1",
+            "call-creator" => "caller@lid",
+            "caller_pn" => "caller@s.whatsapp.net",
+            "type" => "group",
+            "group-jid" => "fixture-group@g.us"
+          },
+          content: [%Node{tag: "video"}]
+        }
+      ]
     }
 
-    assert {:ok, ^state} = ConnectionProcess.dispatch(call, state)
+    assert {:ok, state} = ConnectionProcess.dispatch(call, state)
+
+    assert_receive {:connection_event,
+                    {:call,
+                     [
+                       %{
+                         id: "call-1",
+                         status: :offer,
+                         is_video?: true,
+                         is_group?: true
+                       }
+                     ]}}
 
     assert_receive {:sent_node,
                     %Node{
                       tag: "ack",
                       attrs: %{
                         "class" => "call",
-                        "id" => "call-1",
-                        "to" => "5521999999999@s.whatsapp.net"
+                        "id" => "call-stanza-1",
+                        "to" => "fixture-group@g.us"
                       }
                     }}
 
-    refute_receive {:connection_event, _event}
+    ringing = %Node{
+      call
+      | attrs: %{call.attrs | "id" => "call-stanza-2"},
+        content: [
+          %Node{tag: "ringing", attrs: %{"call-id" => "call-1", "from" => "caller@lid"}}
+        ]
+    }
+
+    assert {:ok, state} = ConnectionProcess.dispatch(ringing, state)
+
+    assert_receive {:connection_event, {:call, [ringing_event]}}
+    assert ringing_event.status == :ringing
+    assert ringing_event.caller_pn == "caller@s.whatsapp.net"
+    assert ringing_event.is_video?
+    assert ringing_event.is_group?
+    assert ringing_event.group_jid == "fixture-group@g.us"
+    assert map_size(state.call_offers) == 1
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "call-stanza-2"}}}
+
+    client_state = %{subscribers: %{self() => make_ref()}}
+
+    assert {:noreply, ^client_state} =
+             Client.handle_info({:connection_event, {:call, [ringing_event]}}, client_state)
+
+    assert_receive {:baileys, _client, {:call, [%Baileys.Call{status: :ringing}]}}
+
+    timeout = %Node{
+      ringing
+      | attrs: %{ringing.attrs | "id" => "call-stanza-3"},
+        content: [
+          %Node{
+            tag: "terminate",
+            attrs: %{"call-id" => "call-1", "reason" => "timeout"}
+          }
+        ]
+    }
+
+    assert {:ok, state} = ConnectionProcess.dispatch(timeout, state)
+    assert_receive {:connection_event, {:call, [timeout_event]}}
+    assert timeout_event.status == :timeout
+    assert timeout_event.is_video?
+    assert timeout_event.group_jid == "fixture-group@g.us"
+    assert state.call_offers == %{}
+    assert_receive {:sent_node, %Node{tag: "ack", attrs: %{"id" => "call-stanza-3"}}}
+  end
+
+  test "bounds and expires call offer metadata", %{state: state} do
+    state =
+      state
+      |> Map.put(:call_offer_limit, 1)
+      |> Map.put(:call_offer_ttl, 100)
+      |> Map.put(:monotonic_now, fn -> 0 end)
+
+    state =
+      Enum.reduce(["call-1", "call-2"], state, fn id, state ->
+        node = call_fixture(id, "offer")
+        assert {:ok, state} = ConnectionProcess.dispatch(node, state)
+        assert_receive {:connection_event, {:call, [_call]}}
+        assert_receive {:sent_node, %Node{tag: "ack"}}
+        state
+      end)
+
+    assert Map.keys(state.call_offers) == ["call-2"]
+
+    state = Map.put(state, :monotonic_now, fn -> 101 end)
+    assert {:ok, state} = ConnectionProcess.dispatch(call_fixture("call-2", "ringing"), state)
+    assert_receive {:connection_event, {:call, [ringing]}}
+    assert ringing.is_video? == nil
+    assert state.call_offers == %{}
+    assert_receive {:sent_node, %Node{tag: "ack"}}
   end
 
   test "attempts acknowledgements for malformed notification and call stanzas", %{state: state} do
@@ -1161,6 +1483,29 @@ defmodule BaileysExo.ConnectionProcessTest do
     padding = :binary.last(padded)
     decoded = padded |> binary_part(0, byte_size(padded) - padding) |> Message.decode()
     decoded.extendedTextMessage.text
+  end
+
+  defp call_fixture(id, status) do
+    content =
+      if status == "offer" do
+        [%Node{tag: "video"}]
+      end
+
+    %Node{
+      tag: "call",
+      attrs: %{
+        "id" => "stanza-#{id}-#{status}",
+        "from" => "caller@s.whatsapp.net",
+        "t" => "1700000000"
+      },
+      content: [
+        %Node{
+          tag: status,
+          attrs: %{"call-id" => id, "from" => "caller@s.whatsapp.net"},
+          content: content
+        }
+      ]
+    }
   end
 
   defp encrypted_incoming_message(content, attrs \\ %{}) do

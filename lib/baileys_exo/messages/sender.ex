@@ -11,6 +11,8 @@ defmodule BaileysExo.Messages.Sender do
 
   def send_text(connection, %Credentials{me: me} = credentials, recipient, text)
       when is_map(me) and is_binary(text) and byte_size(text) > 0 do
+    base_credentials = credentials
+
     with {:ok, recipient} <- Baileys.jid(recipient),
          {:ok, reply} <-
            ConnectionProcess.query(
@@ -28,11 +30,16 @@ defmodule BaileysExo.Messages.Sender do
          material = retry_material(recipient, text),
          {:ok, participants, credentials} <- encrypt_devices(credentials, devices, material),
          id = message_id(),
-         :ok <- ConnectionProcess.commit_credentials(connection, credentials),
+         {:ok, credentials} <-
+           ConnectionProcess.commit_credentials(connection, base_credentials, credentials),
+         stanza =
+           id
+           |> relay_stanza(recipient, participants, credentials.account)
+           |> attach_privacy_token(recipient, credentials),
          :ok <-
            ConnectionProcess.relay(
              connection,
-             relay_stanza(id, recipient, participants, credentials.account),
+             stanza,
              material
            ) do
       {:ok, %SentMessage{id: id, to: recipient, accepted_at: DateTime.utc_now()}, credentials}
@@ -86,6 +93,7 @@ defmodule BaileysExo.Messages.Sender do
         |> relay_stanza(recipient, [{wire_requester, type, ciphertext}], credentials.account)
         |> route_retry(recipient, wire_requester, requester, credentials)
         |> put_retry_count(count)
+        |> attach_privacy_token(recipient, credentials)
 
       {:ok, stanza, credentials}
     end
@@ -365,6 +373,36 @@ defmodule BaileysExo.Messages.Sender do
   end
 
   defp session_address(credentials, jid), do: wire_jid(credentials, jid)
+
+  @doc false
+  def attach_privacy_token(%Node{content: content} = stanza, recipient, credentials) do
+    storage_jid = wire_jid(credentials, recipient)
+
+    case credentials.privacy_tokens[storage_jid] || credentials.privacy_tokens[recipient] do
+      %{token: token, timestamp: timestamp}
+      when is_binary(token) and byte_size(token) > 0 and is_integer(timestamp) ->
+        if privacy_token_expired?(timestamp) do
+          stanza
+        else
+          token = %Node{
+            tag: "tctoken",
+            attrs: %{"t" => Integer.to_string(timestamp)},
+            content: token
+          }
+
+          %{stanza | content: List.wrap(content) ++ [token]}
+        end
+
+      _missing ->
+        stanza
+    end
+  end
+
+  defp privacy_token_expired?(timestamp) do
+    bucket_duration = 604_800
+    current_bucket = div(System.system_time(:second), bucket_duration)
+    timestamp < (current_bucket - 3) * bucket_duration
+  end
 
   defp message_id, do: "3EB0" <> (:crypto.strong_rand_bytes(9) |> Base.encode16(case: :upper))
 end

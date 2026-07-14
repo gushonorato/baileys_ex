@@ -15,7 +15,7 @@ defmodule BaileysExo.Store.FileTest do
     path = Path.join(root, "safe.json")
     assert :ok = FileStore.save(path, credentials)
 
-    assert {:ok, %{"version" => 2}} =
+    assert {:ok, %{"version" => 3}} =
              path |> File.read!() |> Jason.decode()
 
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "safe")
@@ -99,7 +99,7 @@ defmodule BaileysExo.Store.FileTest do
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
-    File.write!(path, Jason.encode!(%{"version" => 3, "credentials" => %{}}))
+    File.write!(path, Jason.encode!(%{"version" => 4, "credentials" => %{}}))
 
     assert {:error, :unsupported_session_version} = FileStore.load_or_create(root, "future")
   end
@@ -121,6 +121,25 @@ defmodule BaileysExo.Store.FileTest do
 
     File.write!(path, Jason.encode!(document))
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-one")
+  end
+
+  test "migrates version two JSON with empty account settings" do
+    root = temporary_root()
+    path = Path.join(root, "version-two.json")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    credentials = Credentials.new()
+    assert :ok = FileStore.save(path, credentials)
+    document = path |> File.read!() |> Jason.decode!()
+
+    document =
+      document
+      |> Map.put("version", 2)
+      |> update_in(["credentials"], &Map.delete(&1, "account_settings"))
+
+    File.write!(path, Jason.encode!(document))
+    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-two")
   end
 
   test "rejects malformed Base64 in JSON credentials" do
@@ -219,7 +238,15 @@ defmodule BaileysExo.Store.FileTest do
         pre_keys: %{7 => key_pair},
         sessions: %{"5511999999999.1" => %{sessions: %{"session-id" => session}}},
         sender_keys: %{"fixture-group@g.us::1_1::2" => sender_key},
-        lid_mappings: %{"5511999999999@s.whatsapp.net" => "1@lid"}
+        lid_mappings: %{"5511999999999@s.whatsapp.net" => "1@lid"},
+        account_settings: %{
+          default_disappearing_mode: %{
+            ephemeral_expiration: 86_400,
+            ephemeral_setting_timestamp: 1_700_000_000
+          }
+        },
+        privacy_tokens: %{"1@lid" => %{token: <<33, 34>>, timestamp: 1_700_000_000}},
+        pending_app_state_sync: ["critical_block", "regular"]
     }
   end
 end

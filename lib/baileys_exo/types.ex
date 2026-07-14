@@ -25,6 +25,90 @@ defmodule Baileys.Account do
   defstruct [:jid, :name]
 end
 
+defmodule Baileys.Call do
+  @moduledoc "Call lifecycle event. Events are emitted as ordered one-element batches."
+
+  @type status ::
+          :offer
+          | :ringing
+          | :preaccept
+          | :transport
+          | :relay_latency
+          | :timeout
+          | :reject
+          | :accept
+          | :terminate
+
+  @type t :: %__MODULE__{
+          id: String.t(),
+          chat_id: String.t(),
+          from: String.t() | nil,
+          caller_pn: String.t() | nil,
+          date: DateTime.t(),
+          status: status(),
+          offline?: boolean(),
+          is_video?: boolean() | nil,
+          is_group?: boolean() | nil,
+          group_jid: String.t() | nil,
+          latency_ms: number() | nil
+        }
+
+  @enforce_keys [:id, :chat_id, :date, :status]
+  defstruct [
+    :id,
+    :chat_id,
+    :from,
+    :caller_pn,
+    :date,
+    :status,
+    :is_video?,
+    :is_group?,
+    :group_jid,
+    :latency_ms,
+    offline?: false
+  ]
+end
+
+defmodule Baileys.ContactUpdate do
+  @moduledoc "Externally visible contact metadata change."
+  @enforce_keys [:id, :img_url]
+  defstruct [:id, :img_url]
+end
+
+defmodule Baileys.BlocklistUpdate do
+  @moduledoc "Incremental blocklist change."
+  @enforce_keys [:blocklist, :type]
+  defstruct [:blocklist, :type]
+end
+
+defmodule Baileys.DefaultDisappearingMode do
+  @moduledoc "Default disappearing-message account setting."
+  @enforce_keys [:ephemeral_expiration, :ephemeral_setting_timestamp]
+  defstruct [:ephemeral_expiration, :ephemeral_setting_timestamp]
+end
+
+defmodule Baileys.AccountSettings do
+  @moduledoc "Non-secret account settings synchronized by WhatsApp."
+  defstruct [:default_disappearing_mode]
+end
+
+defmodule Baileys.MediaRetryData do
+  @moduledoc "Encrypted response to a media retry request."
+  @enforce_keys [:ciphertext, :iv]
+  defstruct [:ciphertext, :iv]
+end
+
+defmodule Baileys.MediaRetryError do
+  @moduledoc "Media retry failure returned by WhatsApp."
+  defstruct [:code, :status_code, attrs: %{}]
+end
+
+defmodule Baileys.MediaUpdate do
+  @moduledoc "Media retry result targeting a complete message key."
+  @enforce_keys [:key]
+  defstruct [:key, :media, :error]
+end
+
 defmodule Baileys.TextMessage do
   @moduledoc "Normalized incoming or synchronized text message."
 
