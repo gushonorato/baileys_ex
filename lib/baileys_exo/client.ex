@@ -69,6 +69,7 @@ defmodule BaileysExo.Client do
       key: public_key(envelope.key),
       content: envelope.content,
       raw_content: envelope.raw_content,
+      raw_payloads: Map.get(envelope, :raw_payloads, List.wrap(envelope.raw_content)),
       timestamp: envelope.timestamp,
       status: envelope.status,
       category: envelope.category,

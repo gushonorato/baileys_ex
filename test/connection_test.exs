@@ -1253,6 +1253,8 @@ defmodule BaileysExo.ConnectionProcessTest do
     assert_receive {:connection_event, {:messages_upsert, [envelope], :notify, nil}}
     assert envelope.content.conversation == group_content.conversation
     assert envelope.content.senderKeyDistributionMessage
+    assert length(envelope.raw_payloads) == 2
+    assert envelope.raw_content == List.last(envelope.raw_payloads)
   end
 
   test "retries a combined stanza when skmsg fails after a valid distribution", %{state: state} do

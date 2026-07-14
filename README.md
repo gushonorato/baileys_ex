@@ -50,6 +50,16 @@ defmodule MyWhatsApp do
     {:noreply, state}
   end
 
+  def handle_event(%Baileys.Event{type: :messages_upsert, data: upsert}, state) do
+    Enum.each(upsert.messages, &IO.inspect(&1, label: "complete message"))
+    {:noreply, state}
+  end
+
+  def handle_event(%Baileys.Event{type: :text_message, data: text}, state) do
+    IO.puts("legacy text projection: #{text.text}")
+    {:noreply, state}
+  end
+
   def handle_event(_event, state), do: {:noreply, state}
 end
 ```

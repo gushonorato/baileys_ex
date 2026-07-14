@@ -1244,9 +1244,13 @@ defmodule BaileysExo.ConnectionProcess do
   defp decrypt_message(node, credentials) do
     with {:ok, context} <- Receiver.context(node, credentials),
          encrypted when encrypted != [] <- ordered_encrypted_payloads(node),
-         {:ok, message, raw_content, credentials} <-
+         {:ok, message, raw_payloads, credentials} <-
            decrypt_payloads(encrypted, context, credentials) do
-      envelope = Receiver.envelope(context, message, raw_content)
+      envelope =
+        context
+        |> Receiver.envelope(message, List.last(raw_payloads))
+        |> Map.put(:raw_payloads, raw_payloads)
+
       {:ok, envelope, credentials, context.protocol_response}
     else
       [] -> {:error, :missing_encrypted_message}
@@ -1267,30 +1271,30 @@ defmodule BaileysExo.ConnectionProcess do
   defp decrypt_payloads(encrypted, context, credentials) do
     encrypted
     |> Enum.reduce(
-      {nil, nil, credentials, []},
-      fn encrypted, {message, raw_content, credentials, errors} ->
+      {nil, [], credentials, []},
+      fn encrypted, {message, raw_payloads, credentials, errors} ->
         case decrypt_encrypted_payload(encrypted, context, credentials) do
           {:ok, decoded, unpadded, credentials} ->
-            {merge_messages(message, decoded), unpadded, credentials, errors}
+            {merge_messages(message, decoded), [unpadded | raw_payloads], credentials, errors}
 
           {:error, reason} ->
-            {message, raw_content, credentials, [{encrypted.attrs["type"], reason} | errors]}
+            {message, raw_payloads, credentials, [{encrypted.attrs["type"], reason} | errors]}
         end
       end
     )
     |> case do
-      {message, raw_content, credentials, errors} ->
-        finish_decrypted_payloads(message, raw_content, credentials, errors)
+      {message, raw_payloads, credentials, errors} ->
+        finish_decrypted_payloads(message, Enum.reverse(raw_payloads), credentials, errors)
     end
   end
 
-  defp finish_decrypted_payloads(message, raw_content, credentials, errors) do
+  defp finish_decrypted_payloads(message, raw_payloads, credentials, errors) do
     case Enum.find(errors, fn {type, _reason} -> type == "skmsg" end) do
       {_type, reason} ->
         {:error, reason, credentials}
 
-      nil when is_struct(message, Message) and is_binary(raw_content) ->
-        {:ok, message, raw_content, credentials}
+      nil when is_struct(message, Message) and raw_payloads != [] ->
+        {:ok, message, raw_payloads, credentials}
 
       nil when errors != [] ->
         {_type, reason} = hd(errors)
