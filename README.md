@@ -62,8 +62,9 @@ calling the callback process itself.
 `sessions_path` is required and must be absolute. Credentials, prekeys, direct
 Signal sessions and group sender-key records are persisted as
 `<sessions_path>/<session>.json` using a versioned schema and Base64 for binary
-fields. Schema v2 adds sender-key storage and schema v3 adds non-secret account
-settings, privacy tokens and pending app-state collections; schema v1/v2 JSON and files from the previous
+fields. Schema v2 adds sender-key storage, schema v3 adds non-secret account
+settings/privacy tokens, and schema v4 adds resumable history/app-state data.
+Schema v1-v3 JSON and files from the previous
 `<sessions_path>/<session>/session.json` layout and legacy
 `session.etf` files are safely migrated on first load. The directory and file
 modes are `0700` and `0600`. Do not run two clients against the same session.
@@ -181,6 +182,9 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :contacts_update, data: [%Baileys.ContactUpdate{}]}
 %Baileys.Event{client: client, type: :blocklist_update, data: %Baileys.BlocklistUpdate{}}
 %Baileys.Event{client: client, type: :settings_update, data: %Baileys.AccountSettings{}}
+%Baileys.Event{client: client, type: :messaging_history_set, data: %Baileys.MessagingHistorySet{}}
+%Baileys.Event{client: client, type: :messaging_history_status, data: %Baileys.MessagingHistoryStatus{}}
+%Baileys.Event{client: client, type: :app_state_mutations, data: [%Baileys.AppStateMutation{}]}
 %Baileys.Event{client: client, type: :groups_upsert, data: [%Baileys.GroupMetadata{}]}
 %Baileys.Event{client: client, type: :groups_update, data: [%Baileys.GroupUpdate{}]}
 %Baileys.Event{client: client, type: :group_participants_update, data: %Baileys.GroupParticipantsUpdate{}}
@@ -232,8 +236,20 @@ maintain Signal state; low-prekey handling emits no public secret material.
 Trusted-contact privacy tokens are persisted internally and attached to eligible
 1:1 sends while current. Server-sync collection names are validated and persisted
 for the history/app-state synchronization layer. Every recognized category is
-ACKed exactly once, including malformed payloads. History synchronization itself
-is not yet exposed as a complete public event.
+ACKed exactly once, including malformed payloads.
+
+History notifications remain visible in `:messages_upsert`, receive the required
+`hist_sync` receipt, and are processed FIFO outside the socket process. Inline or
+remote archives are hash/MAC checked, decrypted, inflated and emitted without
+reordering as `:messaging_history_set`; historical messages retain their complete
+`WebMessageInfo`. Progress, request/session IDs, LID mappings and pause/completion
+status survive persistence and buffering boundaries.
+
+App-state key shares and per-collection LT-hash state are persisted in schema v4.
+Snapshots and consecutive patches validate value, index, snapshot, patch and
+media MACs before versions advance. Verified actions are emitted as deterministic
+typed `:app_state_mutations`; integrity failures leave prior state intact and
+pending collections resume after reconnect.
 
 ## Lifecycle
 

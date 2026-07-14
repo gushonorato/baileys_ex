@@ -6,6 +6,8 @@ defmodule BaileysExo.Client do
   alias Baileys.{
     Account,
     AccountSettings,
+    AppStateMutation,
+    AppStateEffect,
     BlocklistUpdate,
     Call,
     Connection,
@@ -27,6 +29,7 @@ defmodule BaileysExo.Client do
     MediaRetryData,
     MediaRetryError,
     MediaUpdate,
+    MessagingHistoryStatus,
     MessagesUpsert,
     QR,
     TextMessage,
@@ -34,6 +37,8 @@ defmodule BaileysExo.Client do
   }
 
   alias BaileysExo.ConnectionProcess
+  alias BaileysExo.HistorySync
+  alias BaileysExo.Media.Download
   alias BaileysExo.Messages.Sender
   alias BaileysExo.Store.File, as: FileStore
 
@@ -95,7 +100,12 @@ defmodule BaileysExo.Client do
          connection_monitor: nil,
          credentials: credentials,
          session_path: session_path,
-         options: options
+         options: options,
+         history_queue: pending_history_queue(credentials),
+         history_worker: nil,
+         history_pause_timer: nil,
+         history_completed: MapSet.new(),
+         history_retries: %{}
        }}
     else
       {:error, reason} -> {:stop, reason}
@@ -178,7 +188,12 @@ defmodule BaileysExo.Client do
                connection_monitor: nil,
                credentials: credentials,
                session_path: session_path,
-               status: :disconnected
+               status: :disconnected,
+               history_queue: :queue.new(),
+               history_worker: nil,
+               history_pause_timer: nil,
+               history_completed: MapSet.new(),
+               history_retries: %{}
            }}
         else
           {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
@@ -234,7 +249,18 @@ defmodule BaileysExo.Client do
   @impl true
   def handle_info({:connection_event, {:connection, status}}, state) do
     notify(state, {:connection, %Connection{state: status}})
-    {:noreply, %{state | status: status}}
+    state = %{state | status: status}
+
+    state =
+      if status == :online and is_nil(Map.get(state, :history_worker)) do
+        state
+        |> Map.put(:history_queue, pending_history_queue(state.credentials))
+        |> start_next_history()
+      else
+        state
+      end
+
+    {:noreply, state}
   end
 
   def handle_info({:connection_event, {:qr, payload}}, state) do
@@ -290,6 +316,22 @@ defmodule BaileysExo.Client do
     {:noreply, state}
   end
 
+  def handle_info({:connection_event, {:app_state_mutations, mutations}}, state) do
+    notify(state, {:app_state_mutations, Enum.map(mutations, &struct!(AppStateMutation, &1))})
+    {:noreply, state}
+  end
+
+  def handle_info({:connection_event, {:app_state_effects, effects}}, state) do
+    effects =
+      Enum.map(effects, fn effect ->
+        mutation = struct!(AppStateMutation, effect.data)
+        %AppStateEffect{type: effect.type, data: mutation}
+      end)
+
+    notify(state, {:app_state_effects, effects})
+    {:noreply, state}
+  end
+
   def handle_info({:connection_event, {:text_message, metadata, text}}, state) do
     message = %TextMessage{
       id: metadata.id,
@@ -319,7 +361,50 @@ defmodule BaileysExo.Client do
 
     notify(state, {:messages_upsert, upsert})
     project_specialized_message_events(state, messages)
-    {:noreply, state}
+    {:noreply, enqueue_history(envelopes, state)}
+  end
+
+  def handle_info(
+        {:history_result, reference, result},
+        %{history_worker: {reference, notification}} = state
+      ) do
+    state = %{state | history_worker: nil}
+
+    state =
+      case result do
+        {:ok, history} ->
+          history = %{history | latest?: history_latest?(history, state)}
+          mappings = Enum.map(history.lid_pn_mappings, &%{lid: &1.lid, pn: &1.pn})
+
+          case commit_history(state, mappings, history, notification) do
+            :ok ->
+              notify(state, {:messaging_history_set, history})
+              update_history_status(history, state)
+
+            {:error, reason} ->
+              notify(state, {:error, %Error{message: inspect({:history_persist_failed, reason})}})
+              retry_history(notification, state)
+          end
+
+        {:error, reason} ->
+          notify(state, {:error, %Error{message: inspect({:history_sync_failed, reason})}})
+          retry_history(notification, state)
+      end
+
+    {:noreply, start_next_history(state)}
+  end
+
+  def handle_info({:history_pause, sync_type}, state) do
+    completed = Map.get(state, :history_completed, MapSet.new())
+
+    if not MapSet.member?(completed, sync_type) and Map.get(state, :history_pause_timer) do
+      notify(state, {
+        :messaging_history_status,
+        %MessagingHistoryStatus{sync_type: sync_type, status: :paused, explicit?: false}
+      })
+    end
+
+    {:noreply, %{state | history_pause_timer: nil}}
   end
 
   def handle_info({:connection_event, {:messages_update, updates}}, state) do
@@ -617,6 +702,177 @@ defmodule BaileysExo.Client do
 
   defp public_group_effect(:group_join_request, update), do: struct!(GroupJoinRequest, update)
 
+  defp enqueue_history(envelopes, state) do
+    {queue, added?} =
+      Enum.reduce(envelopes, {Map.get(state, :history_queue, :queue.new()), false}, fn envelope,
+                                                                                       {queue,
+                                                                                        added?} ->
+        case HistorySync.detect(envelope.content) do
+          {:ok, notification} when envelope.key.from_me ->
+            if history_processed?(notification, state) do
+              {queue, added?}
+            else
+              {:queue.in(notification, queue), true}
+            end
+
+          _not_history ->
+            {queue, added?}
+        end
+      end)
+
+    if added?, do: start_next_history(Map.put(state, :history_queue, queue)), else: state
+  end
+
+  defp start_next_history(state) do
+    if Map.get(state, :history_worker) do
+      state
+    else
+      do_start_next_history(state)
+    end
+  end
+
+  defp do_start_next_history(state) do
+    case :queue.out(Map.get(state, :history_queue, :queue.new())) do
+      {{:value, notification}, queue} ->
+        reference = make_ref()
+        client = self()
+        downloader = Keyword.get(state.options, :history_downloader, &Download.get/1)
+
+        Task.start(fn ->
+          downloaded =
+            if is_binary(notification.initialHistBootstrapInlinePayload) and
+                 byte_size(notification.initialHistBootstrapInlinePayload) > 0 do
+              {:ok, nil}
+            else
+              downloader.(notification.directPath)
+            end
+
+          result =
+            with {:ok, bytes} <- downloaded do
+              HistorySync.process(notification, bytes)
+            end
+
+          send(client, {:history_result, reference, result})
+        end)
+
+        state
+        |> Map.put(:history_queue, queue)
+        |> Map.put(:history_worker, {reference, notification})
+
+      {:empty, _queue} ->
+        state
+    end
+  end
+
+  defp commit_history(%{connection: connection} = _state, mappings, history, notification)
+       when is_pid(connection) do
+    ConnectionProcess.commit_history(connection, mappings, %{
+      sync_type: history.sync_type,
+      progress: history.progress,
+      chunk_order: history.chunk_order,
+      request_id: history.request_id,
+      peer_data_request_session_id: history.peer_data_request_session_id,
+      original_message_id: history.original_message_id,
+      pending_notification: Protobuf.encode(notification)
+    })
+  catch
+    :exit, _reason -> {:error, :not_connected}
+  end
+
+  defp commit_history(_state, _mappings, _history, _notification), do: {:error, :not_connected}
+
+  defp history_latest?(history, state) do
+    progress = state |> Map.get(:credentials, %{}) |> Map.get(:history_sync_progress, %{})
+    history.sync_type != :on_demand and map_size(progress) == 0
+  end
+
+  defp history_processed?(notification, state) do
+    progress = state |> Map.get(:credentials, %{}) |> Map.get(:history_sync_progress, %{})
+    key = history_notification_key(notification)
+
+    case progress[key] do
+      %{chunk_order: chunk} when is_integer(chunk) and is_integer(notification.chunkOrder) ->
+        chunk >= notification.chunkOrder
+
+      _missing ->
+        false
+    end
+  end
+
+  defp history_notification_key(notification) do
+    metadata = notification.fullHistorySyncOnDemandRequestMetadata
+
+    (metadata && metadata.requestId) || notification.peerDataRequestSessionId ||
+      notification.originalMessageId ||
+      history_sync_type_string(notification.syncType)
+  end
+
+  defp requeue_history(notification, state) do
+    Map.put(state, :history_queue, :queue.in_r(notification, state.history_queue))
+  end
+
+  defp retry_history(notification, state) do
+    key = history_notification_key(notification)
+    retries = Map.get(state, :history_retries, %{})
+    count = Map.get(retries, key, 0) + 1
+    state = Map.put(state, :history_retries, Map.put(retries, key, count))
+
+    if count <= 3 and Map.get(state, :status) == :online,
+      do: requeue_history(notification, state),
+      else: state
+  end
+
+  defp history_sync_type_string(type) when is_atom(type),
+    do: type |> Atom.to_string() |> String.downcase()
+
+  defp history_sync_type_string(type) when is_integer(type), do: "unknown-#{type}"
+  defp history_sync_type_string(_type), do: "unknown"
+
+  defp pending_history_queue(credentials) do
+    Enum.reduce(credentials.pending_history_sync, :queue.new(), fn encoded, queue ->
+      try do
+        :queue.in(BaileysExo.Proto.Message.HistorySyncNotification.decode(encoded), queue)
+      rescue
+        _error -> queue
+      end
+    end)
+  end
+
+  defp update_history_status(history, state) do
+    complete? =
+      history.sync_type == :initial_bootstrap or
+        (history.sync_type == :recent and history.progress == 100)
+
+    cond do
+      complete? ->
+        cancel_timer(state.history_pause_timer)
+        completed = Map.get(state, :history_completed, MapSet.new())
+
+        if not MapSet.member?(completed, history.sync_type) do
+          notify(state, {
+            :messaging_history_status,
+            %MessagingHistoryStatus{
+              sync_type: history.sync_type,
+              status: :complete,
+              explicit?: true
+            }
+          })
+        end
+
+        state
+        |> Map.put(:history_pause_timer, nil)
+        |> Map.put(:history_completed, MapSet.put(completed, history.sync_type))
+
+      history.sync_type == :recent ->
+        cancel_timer(state.history_pause_timer)
+        timer = Process.send_after(self(), {:history_pause, history.sync_type}, 120_000)
+        %{state | history_pause_timer: timer}
+
+      true ->
+        state
+    end
+  end
+
   defp notify(state, event) do
     client = self()
 
@@ -624,6 +880,9 @@ defmodule BaileysExo.Client do
       send(subscriber, {:baileys, client, event})
     end)
   end
+
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(timer), do: Process.cancel_timer(timer)
 
   defp add_subscriber(subscribers, subscriber) do
     Map.put_new_lazy(subscribers, subscriber, fn -> Process.monitor(subscriber) end)

@@ -5,7 +5,7 @@ defmodule BaileysExo.Store.JSONCodec do
   alias BaileysExo.Proto.{ADVSignedDeviceIdentity, SenderKeyRecordStructure}
   alias BaileysExo.Signal.SenderKey
 
-  @version 3
+  @version 4
 
   def encode(%Credentials{} = credentials) do
     Jason.encode(%{
@@ -30,7 +30,7 @@ defmodule BaileysExo.Store.JSONCodec do
     _error -> {:error, :invalid_credentials}
   end
 
-  defp validate_version(%{"version" => version}) when version in [1, 2, @version],
+  defp validate_version(%{"version" => version}) when version in [1, 2, 3, @version],
     do: {:ok, version}
 
   defp validate_version(%{"version" => _version}), do: {:error, :unsupported_session_version}
@@ -58,7 +58,13 @@ defmodule BaileysExo.Store.JSONCodec do
       "lid_mappings" => credentials.lid_mappings,
       "account_settings" => encode_account_settings(credentials.account_settings),
       "privacy_tokens" => Map.new(credentials.privacy_tokens, &encode_privacy_token/1),
-      "pending_app_state_sync" => credentials.pending_app_state_sync
+      "pending_app_state_sync" => credentials.pending_app_state_sync,
+      "history_sync_progress" => encode_history_sync_progress(credentials.history_sync_progress),
+      "pending_history_sync" => Enum.map(credentials.pending_history_sync, &encode_binary/1),
+      "app_state_sync_keys" => Map.new(credentials.app_state_sync_keys, &encode_app_state_key/1),
+      "app_state_collections" =>
+        Map.new(credentials.app_state_collections, &encode_app_state_collection/1),
+      "my_app_state_key_id" => credentials.my_app_state_key_id
     }
   end
 
@@ -84,7 +90,13 @@ defmodule BaileysExo.Store.JSONCodec do
          {:ok, lid_mappings} <- decode_string_map(value["lid_mappings"]),
          {:ok, account_settings} <- decode_account_settings(value, version),
          {:ok, privacy_tokens} <- decode_privacy_tokens(value, version),
-         {:ok, pending_app_state_sync} <- decode_pending_app_state_sync(value, version) do
+         {:ok, pending_app_state_sync} <- decode_pending_app_state_sync(value, version),
+         {:ok, history_sync_progress} <- decode_history_sync_progress(value, version),
+         {:ok, pending_history_sync} <- decode_pending_history_sync(value, version),
+         {:ok, app_state_sync_keys} <- decode_app_state_keys(value, version),
+         {:ok, app_state_collections} <- decode_app_state_collections(value, version),
+         {:ok, my_app_state_key_id} <-
+           decode_optional_string(value, "my_app_state_key_id", version) do
       {:ok,
        %Credentials{
          noise_key: noise_key,
@@ -107,7 +119,12 @@ defmodule BaileysExo.Store.JSONCodec do
          lid_mappings: lid_mappings,
          account_settings: account_settings,
          privacy_tokens: privacy_tokens,
-         pending_app_state_sync: pending_app_state_sync
+         pending_app_state_sync: pending_app_state_sync,
+         history_sync_progress: history_sync_progress,
+         pending_history_sync: pending_history_sync,
+         app_state_sync_keys: app_state_sync_keys,
+         app_state_collections: app_state_collections,
+         my_app_state_key_id: my_app_state_key_id
        }}
     end
   end
@@ -122,7 +139,7 @@ defmodule BaileysExo.Store.JSONCodec do
   defp decode_sender_keys(_value, 1), do: {:ok, %{}}
 
   defp decode_sender_keys(%{"sender_keys" => value}, version)
-       when version in [2, @version] and is_map(value) do
+       when version in [2, 3, @version] and is_map(value) do
     decode_map(value, fn address, encoded ->
       with true <- is_binary(address),
            {:ok, encoded} <- decode_binary(encoded),
@@ -134,7 +151,7 @@ defmodule BaileysExo.Store.JSONCodec do
     end)
   end
 
-  defp decode_sender_keys(_value, version) when version in [2, @version],
+  defp decode_sender_keys(_value, version) when version in [2, 3, @version],
     do: {:error, :invalid_credentials}
 
   defp encode_account_settings(settings) do
@@ -154,8 +171,8 @@ defmodule BaileysExo.Store.JSONCodec do
 
   defp decode_account_settings(_value, version) when version in [1, 2], do: {:ok, %{}}
 
-  defp decode_account_settings(%{"account_settings" => settings}, @version)
-       when is_map(settings) do
+  defp decode_account_settings(%{"account_settings" => settings}, version)
+       when version in [3, @version] and is_map(settings) do
     case settings["default_disappearing_mode"] do
       nil ->
         {:ok, %{}}
@@ -178,7 +195,8 @@ defmodule BaileysExo.Store.JSONCodec do
     end
   end
 
-  defp decode_account_settings(_value, @version), do: {:error, :invalid_credentials}
+  defp decode_account_settings(_value, version) when version in [3, @version],
+    do: {:error, :invalid_credentials}
 
   defp encode_privacy_token({jid, %{token: token, timestamp: timestamp}}) do
     {jid, %{"token" => encode_binary(token), "timestamp" => timestamp}}
@@ -186,7 +204,8 @@ defmodule BaileysExo.Store.JSONCodec do
 
   defp decode_privacy_tokens(_value, version) when version in [1, 2], do: {:ok, %{}}
 
-  defp decode_privacy_tokens(%{"privacy_tokens" => tokens}, @version) when is_map(tokens) do
+  defp decode_privacy_tokens(%{"privacy_tokens" => tokens}, version)
+       when version in [3, @version] and is_map(tokens) do
     decode_map(tokens, fn jid, value ->
       with true <- is_binary(jid) and jid != "",
            %{"token" => token, "timestamp" => timestamp} <- value,
@@ -199,23 +218,183 @@ defmodule BaileysExo.Store.JSONCodec do
     end)
   end
 
-  defp decode_privacy_tokens(_value, @version), do: {:error, :invalid_credentials}
+  defp decode_privacy_tokens(_value, version) when version in [3, @version],
+    do: {:error, :invalid_credentials}
 
   defp decode_pending_app_state_sync(_value, version) when version in [1, 2], do: {:ok, []}
 
-  defp decode_pending_app_state_sync(%{"pending_app_state_sync" => collections}, @version)
-       when is_list(collections) do
+  defp decode_pending_app_state_sync(%{"pending_app_state_sync" => collections}, version)
+       when version in [3, @version] and is_list(collections) do
     allowed = ["critical_block", "critical_unblock_low", "regular_high", "regular_low", "regular"]
 
-    if Enum.all?(collections, &(&1 in allowed)) and
-         length(Enum.uniq(collections)) == length(collections) do
+    if Enum.all?(collections, &(&1 in allowed)) do
       {:ok, collections}
     else
       {:error, :invalid_credentials}
     end
   end
 
-  defp decode_pending_app_state_sync(_value, @version), do: {:error, :invalid_credentials}
+  defp decode_pending_app_state_sync(_value, version) when version in [3, @version],
+    do: {:error, :invalid_credentials}
+
+  defp encode_app_state_key({id, key_data}) do
+    {id, key_data |> Protobuf.encode() |> encode_binary()}
+  end
+
+  defp encode_app_state_collection({name, state}) do
+    index_value_map =
+      Map.new(state.index_value_map, fn {index_mac, value_mac} ->
+        {encode_binary(index_mac), encode_binary(value_mac)}
+      end)
+
+    {name,
+     %{
+       "version" => state.version,
+       "hash" => encode_binary(state.hash),
+       "index_value_map" => index_value_map
+     }}
+  end
+
+  defp encode_history_sync_progress(progress) do
+    Map.new(progress, fn {key, value} ->
+      encoded =
+        Map.new(value, fn
+          {:sync_type, type} when is_atom(type) -> {"sync_type", Atom.to_string(type)}
+          {field, field_value} -> {Atom.to_string(field), field_value}
+        end)
+
+      {key, encoded}
+    end)
+  end
+
+  defp decode_history_sync_progress(_value, version) when version in [1, 2, 3], do: {:ok, %{}}
+
+  defp decode_history_sync_progress(%{"history_sync_progress" => value}, @version)
+       when is_map(value) do
+    allowed = %{
+      "sync_type" => :sync_type,
+      "progress" => :progress,
+      "chunk_order" => :chunk_order,
+      "request_id" => :request_id,
+      "peer_data_request_session_id" => :peer_data_request_session_id,
+      "original_message_id" => :original_message_id
+    }
+
+    decode_map(value, fn key, progress ->
+      if is_map(progress) and Enum.all?(Map.keys(progress), &Map.has_key?(allowed, &1)) do
+        decoded =
+          Map.new(progress, fn
+            {"sync_type", type} -> {:sync_type, history_sync_type(type)}
+            {field, field_value} -> {Map.fetch!(allowed, field), field_value}
+          end)
+
+        {:ok, key, decoded}
+      else
+        {:error, :invalid_credentials}
+      end
+    end)
+  end
+
+  defp decode_history_sync_progress(_value, @version), do: {:error, :invalid_credentials}
+
+  defp decode_pending_history_sync(_value, version) when version in [1, 2, 3], do: {:ok, []}
+
+  defp decode_pending_history_sync(%{"pending_history_sync" => values}, @version)
+       when is_list(values) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, decoded} ->
+      case decode_binary(value) do
+        {:ok, binary} -> {:cont, {:ok, [binary | decoded]}}
+        _error -> {:halt, {:error, :invalid_credentials}}
+      end
+    end)
+    |> case do
+      {:ok, decoded} -> {:ok, Enum.reverse(decoded)}
+      error -> error
+    end
+  end
+
+  defp decode_pending_history_sync(_value, @version), do: {:error, :invalid_credentials}
+
+  defp history_sync_type(nil), do: nil
+  defp history_sync_type(type) when is_integer(type), do: type
+
+  defp history_sync_type("unknown-" <> value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _invalid -> nil
+    end
+  end
+
+  defp history_sync_type(type)
+       when type in [
+              "initial_bootstrap",
+              "initial_status_v3",
+              "full",
+              "recent",
+              "push_name",
+              "non_blocking_data",
+              "on_demand",
+              "no_history",
+              "message_access_status"
+            ],
+       do: String.to_existing_atom(type)
+
+  defp decode_app_state_keys(_value, version) when version in [1, 2, 3], do: {:ok, %{}}
+
+  defp decode_app_state_keys(%{"app_state_sync_keys" => value}, @version) when is_map(value) do
+    decode_map(value, fn id, encoded ->
+      with {:ok, encoded} <- decode_binary(encoded) do
+        {:ok, id, BaileysExo.Proto.Message.AppStateSyncKeyData.decode(encoded)}
+      else
+        _invalid -> {:error, :invalid_credentials}
+      end
+    end)
+  rescue
+    _error -> {:error, :invalid_credentials}
+  end
+
+  defp decode_app_state_keys(_value, @version), do: {:error, :invalid_credentials}
+
+  defp decode_app_state_collections(_value, version) when version in [1, 2, 3], do: {:ok, %{}}
+
+  defp decode_app_state_collections(%{"app_state_collections" => value}, @version)
+       when is_map(value) do
+    decode_map(value, fn name, state ->
+      with %{"version" => version, "hash" => hash, "index_value_map" => index_map} <- state,
+           true <- is_integer(version) and version >= 0 and is_map(index_map),
+           {:ok, hash} <- decode_binary(hash),
+           true <- byte_size(hash) == 128,
+           {:ok, index_map} <- decode_binary_map(index_map) do
+        {:ok, name, %{version: version, hash: hash, index_value_map: index_map}}
+      else
+        _invalid -> {:error, :invalid_credentials}
+      end
+    end)
+  end
+
+  defp decode_app_state_collections(_value, @version), do: {:error, :invalid_credentials}
+
+  defp decode_binary_map(value) do
+    decode_map(value, fn key, encoded ->
+      with {:ok, key} <- decode_binary(key),
+           {:ok, decoded} <- decode_binary(encoded),
+           true <- byte_size(key) == 32 and byte_size(decoded) == 32 do
+        {:ok, key, decoded}
+      else
+        _invalid -> {:error, :invalid_credentials}
+      end
+    end)
+  end
+
+  defp decode_optional_string(_value, _key, version) when version in [1, 2, 3], do: {:ok, nil}
+
+  defp decode_optional_string(value, key, @version) do
+    case value[key] do
+      nil -> {:ok, nil}
+      string when is_binary(string) -> {:ok, string}
+      _invalid -> {:error, :invalid_credentials}
+    end
+  end
 
   defp encode_key_pair(%{public: public, private: private}) do
     %{"public" => encode_binary(public), "private" => encode_binary(private)}

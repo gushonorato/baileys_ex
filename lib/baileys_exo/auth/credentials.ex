@@ -27,7 +27,12 @@ defmodule BaileysExo.Auth.Credentials do
     lid_mappings: %{},
     account_settings: %{},
     privacy_tokens: %{},
-    pending_app_state_sync: []
+    pending_app_state_sync: [],
+    history_sync_progress: %{},
+    pending_history_sync: [],
+    app_state_sync_keys: %{},
+    app_state_collections: %{},
+    my_app_state_key_id: nil
   ]
 
   def new do

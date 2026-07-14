@@ -7,7 +7,8 @@ defmodule BaileysExo.ConnectionProcess do
 
   alias BaileysExo.Auth.Credentials
   alias BaileysExo.Binary.{Codec, Node, NodeUtils}
-  alias BaileysExo.{Calls, Crypto, Noise}
+  alias BaileysExo.{AppState, Calls, Crypto, Noise}
+  alias BaileysExo.HistorySync
   alias BaileysExo.JID
   alias BaileysExo.Protocol.Handshake
   alias BaileysExo.Protocol.{Pairing, USync}
@@ -56,6 +57,10 @@ defmodule BaileysExo.ConnectionProcess do
 
   def commit_credentials(connection, base, credentials) do
     GenServer.call(connection, {:commit_credentials, base, credentials}, 30_000)
+  end
+
+  def commit_history(connection, mappings, progress) do
+    GenServer.call(connection, {:commit_history, mappings, progress}, 30_000)
   end
 
   @doc false
@@ -141,6 +146,7 @@ defmodule BaileysExo.ConnectionProcess do
            call_offer_order: [],
            call_offer_limit: Keyword.get(options, :call_offer_limit, @default_call_offer_limit),
            call_offer_ttl: Keyword.get(options, :call_offer_ttl, @default_call_offer_ttl),
+           app_state_worker: nil,
            max_retry_requesters:
              Keyword.get(options, :max_retry_requesters, @default_max_retry_requesters),
            session_path: Keyword.get(options, :session_path)
@@ -236,6 +242,39 @@ defmodule BaileysExo.ConnectionProcess do
     stop_with_error(reason, state)
   end
 
+  def handle_info(
+        {:app_state_result, reference, result},
+        %{app_state_worker: {reference, base_pending}} = state
+      ) do
+    state = %{state | app_state_worker: nil}
+
+    case result do
+      {:ok, credentials, mutations} ->
+        credentials = merge_app_state_credentials(state.credentials, credentials, base_pending)
+
+        with :ok <- persist_credentials(state.session_path, credentials) do
+          send(state.owner, {:connection_event, {:credentials, credentials}})
+          send(state.owner, {:connection_event, {:app_state_mutations, mutations}})
+
+          send(
+            state.owner,
+            {:connection_event, {:app_state_effects, AppState.project_effects(mutations)}}
+          )
+
+          case maybe_start_app_state_sync(%{state | credentials: credentials}) do
+            {:ok, state} -> {:noreply, state}
+            {:error, reason} -> stop_with_error(reason, state)
+          end
+        else
+          {:error, reason} -> stop_with_error(reason, state)
+        end
+
+      {:error, reason} ->
+        send(state.owner, {:connection_event, {:error, {:app_state_sync_failed, reason}}})
+        {:noreply, state}
+    end
+  end
+
   @impl true
   def handle_call(:close, _from, state) do
     cancel_timer(state.qr_timer)
@@ -307,6 +346,35 @@ defmodule BaileysExo.ConnectionProcess do
     else
       {:error, :credentials_conflict} = error -> {:reply, error, state}
       {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
+    end
+  end
+
+  def handle_call({:commit_history, mappings, progress}, _from, state) do
+    credentials =
+      Enum.reduce(mappings, state.credentials, fn %{pn: pn, lid: lid}, credentials ->
+        put_in(credentials.lid_mappings[pn], lid)
+      end)
+
+    key =
+      progress.request_id || progress.peer_data_request_session_id || progress.original_message_id ||
+        sync_type_string(progress.sync_type)
+
+    pending_notification = progress[:pending_notification]
+    progress = Map.delete(progress, :pending_notification)
+    credentials = put_in(credentials.history_sync_progress[key], progress)
+
+    pending_history_sync =
+      List.delete(credentials.pending_history_sync, pending_notification)
+
+    credentials = %{credentials | pending_history_sync: pending_history_sync}
+
+    case persist_credentials(state.session_path, credentials) do
+      :ok ->
+        send(state.owner, {:connection_event, {:credentials, credentials}})
+        {:reply, :ok, %{state | credentials: credentials}}
+
+      {:error, reason} ->
+        {:reply, {:error, {:store, reason}}, state}
     end
   end
 
@@ -404,10 +472,7 @@ defmodule BaileysExo.ConnectionProcess do
 
           with :ok <- persist_credentials(state.session_path, credentials) do
             send(state.owner, {:connection_event, {:credentials, credentials}})
-            send(state.owner, {:connection_event, {:connection, :online}})
-
-            {:ok,
-             schedule_keepalive(%{state | credentials: credentials, pending_queries: pending})}
+            go_online(%{state | credentials: credentials, pending_queries: pending})
           end
         else
           {:error, {:prekey_upload_failed, node}}
@@ -436,6 +501,31 @@ defmodule BaileysExo.ConnectionProcess do
           retry_prekey_replenishment(notification, attempt, %{state | pending_queries: pending})
         end
 
+      {{:app_state_sync, _collections, timer}, pending} ->
+        Process.cancel_timer(timer)
+
+        if type == "result" do
+          reference = make_ref()
+          connection = self()
+          credentials = state.credentials
+
+          Task.start(fn ->
+            send(
+              connection,
+              {:app_state_result, reference, AppState.process_response(node, credentials)}
+            )
+          end)
+
+          {:ok,
+           %{
+             state
+             | pending_queries: pending,
+               app_state_worker: {reference, credentials.pending_app_state_sync}
+           }}
+        else
+          {:ok, %{state | pending_queries: pending}}
+        end
+
       {{:pairing_finish, credentials, timer}, pending} ->
         Process.cancel_timer(timer)
 
@@ -462,7 +552,10 @@ defmodule BaileysExo.ConnectionProcess do
         {:ok, envelope, credentials, protocol_response} ->
           state = clear_incoming_retry(node, state)
 
-          with {:ok, state} <- acknowledge_message(credentials, protocol_response, state) do
+          with {:ok, state} <- acknowledge_message(credentials, protocol_response, state),
+               {:ok, state} <- acknowledge_history(envelope, state),
+               {:ok, state} <- schedule_initial_app_state(envelope, state),
+               {:ok, state} <- maybe_start_app_state_sync(state) do
             upsert_type = if envelope.offline, do: :append, else: :notify
 
             send(state.owner, {
@@ -695,10 +788,18 @@ defmodule BaileysExo.ConnectionProcess do
   defp process_server_sync_notification(node, state) do
     case NodeUtils.child(node, "collection") do
       %Node{attrs: %{"name" => name}} when name in @app_state_collections ->
-        update_credentials(state, fn credentials ->
-          pending = List.delete(credentials.pending_app_state_sync, name) ++ [name]
-          %{credentials | pending_app_state_sync: pending}
-        end)
+        with {:ok, state} <-
+               update_credentials(state, fn credentials ->
+                 pending =
+                   if app_state_sync_inflight?(state),
+                     do: credentials.pending_app_state_sync ++ [name],
+                     else: List.delete(credentials.pending_app_state_sync, name) ++ [name]
+
+                 %{credentials | pending_app_state_sync: pending}
+               end),
+             {:ok, state} <- maybe_start_app_state_sync(state) do
+          {:ok, state}
+        end
 
       _missing ->
         {:ok, state}
@@ -738,6 +839,24 @@ defmodule BaileysExo.ConnectionProcess do
     else
       {:error, :credentials_conflict}
     end
+  end
+
+  defp merge_app_state_credentials(current, updated, base_pending) do
+    concurrently_added = list_difference(current.pending_app_state_sync, base_pending)
+    pending = updated.pending_app_state_sync ++ concurrently_added
+
+    %{
+      current
+      | app_state_sync_keys: Map.merge(current.app_state_sync_keys, updated.app_state_sync_keys),
+        app_state_collections: updated.app_state_collections,
+        pending_app_state_sync: pending,
+        my_app_state_key_id: updated.my_app_state_key_id || current.my_app_state_key_id,
+        lid_mappings: Map.merge(current.lid_mappings, updated.lid_mappings)
+    }
+  end
+
+  defp list_difference(values, remove) do
+    Enum.reduce(remove, values, fn value, remaining -> List.delete(remaining, value) end)
   end
 
   defp merge_credential_map(current, base, updated) do
@@ -874,6 +993,41 @@ defmodule BaileysExo.ConnectionProcess do
     end
   end
 
+  defp sync_type_string(type) when is_atom(type), do: Atom.to_string(type)
+  defp sync_type_string(type) when is_integer(type), do: "unknown-#{type}"
+  defp sync_type_string(_type), do: "unknown"
+
+  defp start_app_state_sync(collections, state) do
+    track_internal_query(
+      AppState.request_node(collections, state.credentials),
+      {:app_state_sync, collections},
+      state
+    )
+  end
+
+  defp maybe_start_app_state_sync(state) do
+    pending? =
+      state
+      |> Map.get(:pending_queries, %{})
+      |> Map.values()
+      |> Enum.any?(&match?({:app_state_sync, _collections, _timer}, &1))
+
+    cond do
+      Map.get(state, :app_state_worker) -> {:ok, state}
+      pending? -> {:ok, state}
+      state.credentials.pending_app_state_sync == [] -> {:ok, state}
+      true -> start_app_state_sync(state.credentials.pending_app_state_sync, state)
+    end
+  end
+
+  defp app_state_sync_inflight?(state) do
+    not is_nil(Map.get(state, :app_state_worker)) or
+      Enum.any?(Map.values(Map.get(state, :pending_queries, %{})), fn
+        {:app_state_sync, _collections, _timer} -> true
+        _other -> false
+      end)
+  end
+
   defp process_call(node, state) do
     case Calls.decode(node, receipt_clock(state)) do
       {:ok, call} ->
@@ -998,8 +1152,17 @@ defmodule BaileysExo.ConnectionProcess do
         {:ok, state}
       end
     else
-      send(state.owner, {:connection_event, {:connection, :online}})
-      {:ok, schedule_keepalive(state)}
+      go_online(state)
+    end
+  end
+
+  defp go_online(state) do
+    send(state.owner, {:connection_event, {:connection, :online}})
+    state = schedule_keepalive(state)
+
+    case state.credentials.pending_app_state_sync do
+      [] -> {:ok, state}
+      collections -> start_app_state_sync(collections, state)
     end
   end
 
@@ -1037,9 +1200,17 @@ defmodule BaileysExo.ConnectionProcess do
 
           {:pairing_finish, credentials} ->
             {:pairing_finish, credentials, timer}
+
+          {:app_state_sync, collections} ->
+            {:app_state_sync, collections, timer}
         end
 
-      {:ok, %{state | pending_queries: Map.put(state.pending_queries, id, pending_entry)}}
+      {:ok,
+       Map.put(
+         state,
+         :pending_queries,
+         Map.put(Map.get(state, :pending_queries, %{}), id, pending_entry)
+       )}
     end
   end
 
@@ -1136,7 +1307,8 @@ defmodule BaileysExo.ConnectionProcess do
            decrypt_payload(attrs["type"], context, ciphertext, credentials),
          {:ok, unpadded} <- unpad_message(plaintext),
          message <- Message.decode(unpadded),
-         {:ok, credentials} <- process_sender_key_distribution(message, context, credentials) do
+         {:ok, credentials} <- process_sender_key_distribution(message, context, credentials),
+         {:ok, credentials} <- AppState.process_key_share(message, credentials, context.from_me) do
       {:ok, message, unpadded, credentials}
     else
       {:error, _reason} = error -> error
@@ -1350,6 +1522,42 @@ defmodule BaileysExo.ConnectionProcess do
              | credentials: credentials
            }) do
       send(state.owner, {:connection_event, {:credentials, credentials}})
+      {:ok, state}
+    end
+  end
+
+  defp acknowledge_history(envelope, state) do
+    case {HistorySync.receipt(envelope), HistorySync.detect(envelope.content)} do
+      {%Node{} = receipt, {:ok, notification}} ->
+        encoded = Protobuf.encode(notification)
+
+        with {:ok, state} <-
+               update_credentials(state, fn credentials ->
+                 pending = Enum.uniq(credentials.pending_history_sync ++ [encoded])
+                 %{credentials | pending_history_sync: pending}
+               end) do
+          send_node(receipt, state)
+        end
+
+      {nil, _not_history} ->
+        {:ok, state}
+
+      _other ->
+        {:ok, state}
+    end
+  end
+
+  defp schedule_initial_app_state(envelope, state) do
+    initial? =
+      envelope.key.from_me and match?({:ok, _notification}, HistorySync.detect(envelope.content)) and
+        map_size(state.credentials.app_state_collections) == 0 and
+        state.credentials.pending_app_state_sync == []
+
+    if initial? do
+      update_credentials(state, fn credentials ->
+        %{credentials | pending_app_state_sync: @app_state_collections}
+      end)
+    else
       {:ok, state}
     end
   end

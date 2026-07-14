@@ -173,6 +173,7 @@ defmodule Baileys.Message do
           verified_business_name: String.t() | nil,
           stub_type: atom() | nil,
           stub_parameters: [term()],
+          web_message_info: BaileysExo.Proto.WebMessageInfo.t() | nil,
           broadcast?: boolean(),
           offline?: boolean(),
           retry_count: non_neg_integer() | nil
@@ -190,6 +191,7 @@ defmodule Baileys.Message do
     :verified_business_name,
     :stub_type,
     :stub_parameters,
+    :web_message_info,
     :retry_count,
     broadcast?: false,
     offline?: false
@@ -399,4 +401,167 @@ defmodule Baileys.Error do
 
   @enforce_keys [:message]
   defstruct [:message, :code]
+end
+
+defmodule Baileys.HistoryContact do
+  @moduledoc "Contact projected from a history-sync payload."
+
+  @type t :: %__MODULE__{
+          id: String.t(),
+          name: String.t() | nil,
+          notify: String.t() | nil,
+          verified_name: String.t() | nil,
+          username: String.t() | nil,
+          lid: String.t() | nil,
+          phone_number: String.t() | nil
+        }
+
+  @enforce_keys [:id]
+  defstruct [:id, :name, :notify, :verified_name, :username, :lid, :phone_number]
+end
+
+defmodule Baileys.LIDMapping do
+  @moduledoc "A linked-identity mapping between a LID and phone-number JID."
+
+  @type t :: %__MODULE__{lid: String.t(), pn: String.t()}
+  @enforce_keys [:lid, :pn]
+  defstruct [:lid, :pn]
+end
+
+defmodule Baileys.HistoryPastParticipant do
+  @moduledoc "A former group participant included in history sync."
+
+  @type t :: %__MODULE__{
+          user_jid: String.t() | nil,
+          leave_reason: atom() | nil,
+          leave_timestamp: non_neg_integer() | nil
+        }
+
+  defstruct [:user_jid, :leave_reason, :leave_timestamp]
+end
+
+defmodule Baileys.HistoryPastParticipants do
+  @moduledoc "Former participants grouped by chat."
+
+  @type t :: %__MODULE__{
+          group_jid: String.t() | nil,
+          participants: [Baileys.HistoryPastParticipant.t()]
+        }
+
+  defstruct [:group_jid, participants: []]
+end
+
+defmodule Baileys.HistoryConversation do
+  @moduledoc "Ordered conversation projected from a history-sync payload."
+
+  @type t :: %__MODULE__{
+          id: String.t(),
+          name: String.t() | nil,
+          display_name: String.t() | nil,
+          username: String.t() | nil,
+          lid: String.t() | nil,
+          phone_number: String.t() | nil,
+          new_jid: String.t() | nil,
+          old_jid: String.t() | nil,
+          last_message_timestamp: non_neg_integer() | nil,
+          conversation_timestamp: non_neg_integer() | nil,
+          unread_count: non_neg_integer() | nil,
+          read_only?: boolean() | nil,
+          archived?: boolean() | nil,
+          marked_as_unread?: boolean() | nil,
+          pinned: non_neg_integer() | nil,
+          mute_end_time: non_neg_integer() | nil,
+          end_of_history_transfer?: boolean() | nil,
+          end_of_history_transfer_type: atom() | nil,
+          ephemeral_expiration: non_neg_integer() | nil,
+          ephemeral_setting_timestamp: integer() | nil,
+          messages: [Baileys.Message.t()],
+          web_conversation: BaileysExo.Proto.Conversation.t()
+        }
+
+  @enforce_keys [:id]
+  defstruct [
+    :id,
+    :name,
+    :display_name,
+    :username,
+    :lid,
+    :phone_number,
+    :new_jid,
+    :old_jid,
+    :last_message_timestamp,
+    :conversation_timestamp,
+    :unread_count,
+    :read_only?,
+    :archived?,
+    :marked_as_unread?,
+    :pinned,
+    :mute_end_time,
+    :end_of_history_transfer?,
+    :end_of_history_transfer_type,
+    :ephemeral_expiration,
+    :ephemeral_setting_timestamp,
+    :web_conversation,
+    messages: []
+  ]
+end
+
+defmodule Baileys.MessagingHistorySet do
+  @moduledoc "A complete, ordered `messaging-history.set` payload."
+
+  @type t :: %__MODULE__{
+          conversations: [Baileys.HistoryConversation.t()],
+          contacts: [Baileys.HistoryContact.t()],
+          messages: [Baileys.Message.t()],
+          status_v3_messages: [Baileys.Message.t()],
+          lid_pn_mappings: [Baileys.LIDMapping.t()],
+          past_participants: [Baileys.HistoryPastParticipants.t()],
+          sync_type: atom() | nil,
+          progress: non_neg_integer() | nil,
+          chunk_order: non_neg_integer() | nil,
+          latest?: boolean(),
+          request_id: String.t() | nil,
+          peer_data_request_session_id: String.t() | nil,
+          original_message_id: String.t() | nil,
+          oldest_message_in_chunk_timestamp: integer() | nil,
+          enc_handle: String.t() | nil,
+          complete_access_granted?: boolean() | nil
+        }
+
+  defstruct [
+    :sync_type,
+    :progress,
+    :chunk_order,
+    :request_id,
+    :peer_data_request_session_id,
+    :original_message_id,
+    :oldest_message_in_chunk_timestamp,
+    :enc_handle,
+    :complete_access_granted?,
+    conversations: [],
+    contacts: [],
+    messages: [],
+    status_v3_messages: [],
+    lid_pn_mappings: [],
+    past_participants: [],
+    latest?: false
+  ]
+end
+
+defmodule Baileys.MessagingHistoryStatus do
+  @moduledoc "History synchronization completion or inactivity state."
+  @enforce_keys [:sync_type, :status, :explicit?]
+  defstruct [:sync_type, :status, :explicit?]
+end
+
+defmodule Baileys.AppStateMutation do
+  @moduledoc "Authenticated app-state mutation with its collection and version."
+  @enforce_keys [:collection, :version, :operation, :index, :sync_action]
+  defstruct [:collection, :version, :operation, :index, :sync_action]
+end
+
+defmodule Baileys.AppStateEffect do
+  @moduledoc "Deterministic domain routing for an authenticated app-state mutation."
+  @enforce_keys [:type, :data]
+  defstruct [:type, :data]
 end

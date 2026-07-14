@@ -2,7 +2,7 @@ defmodule BaileysExo.Store.FileTest do
   use ExUnit.Case, async: true
 
   alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Proto.ADVSignedDeviceIdentity
+  alias BaileysExo.Proto.{ADVSignedDeviceIdentity, Message}
   alias BaileysExo.Signal.SenderKey
   alias BaileysExo.Store.File, as: FileStore
 
@@ -15,7 +15,7 @@ defmodule BaileysExo.Store.FileTest do
     path = Path.join(root, "safe.json")
     assert :ok = FileStore.save(path, credentials)
 
-    assert {:ok, %{"version" => 3}} =
+    assert {:ok, %{"version" => 4}} =
              path |> File.read!() |> Jason.decode()
 
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "safe")
@@ -99,7 +99,7 @@ defmodule BaileysExo.Store.FileTest do
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
-    File.write!(path, Jason.encode!(%{"version" => 4, "credentials" => %{}}))
+    File.write!(path, Jason.encode!(%{"version" => 5, "credentials" => %{}}))
 
     assert {:error, :unsupported_session_version} = FileStore.load_or_create(root, "future")
   end
@@ -140,6 +140,32 @@ defmodule BaileysExo.Store.FileTest do
 
     File.write!(path, Jason.encode!(document))
     assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-two")
+  end
+
+  test "migrates version three JSON with empty history and app-state storage" do
+    root = temporary_root()
+    path = Path.join(root, "version-three.json")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    credentials = Credentials.new()
+    assert :ok = FileStore.save(path, credentials)
+    document = path |> File.read!() |> Jason.decode!()
+
+    document =
+      document
+      |> Map.put("version", 3)
+      |> update_in(["credentials"], fn stored ->
+        Map.drop(stored, [
+          "history_sync_progress",
+          "app_state_sync_keys",
+          "app_state_collections",
+          "my_app_state_key_id"
+        ])
+      end)
+
+    File.write!(path, Jason.encode!(document))
+    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-three")
   end
 
   test "rejects malformed Base64 in JSON credentials" do
@@ -246,7 +272,28 @@ defmodule BaileysExo.Store.FileTest do
           }
         },
         privacy_tokens: %{"1@lid" => %{token: <<33, 34>>, timestamp: 1_700_000_000}},
-        pending_app_state_sync: ["critical_block", "regular"]
+        pending_app_state_sync: ["critical_block", "regular"],
+        history_sync_progress: %{
+          "history-request" => %{
+            sync_type: :recent,
+            progress: 50,
+            chunk_order: 2,
+            request_id: "history-request",
+            peer_data_request_session_id: nil,
+            original_message_id: "history-message"
+          }
+        },
+        app_state_sync_keys: %{
+          "a2V5" => %Message.AppStateSyncKeyData{keyData: :binary.copy(<<35>>, 32), timestamp: 1}
+        },
+        app_state_collections: %{
+          "regular" => %{
+            version: 1,
+            hash: :binary.copy(<<0>>, 128),
+            index_value_map: %{:binary.copy(<<36>>, 32) => :binary.copy(<<37>>, 32)}
+          }
+        },
+        my_app_state_key_id: "a2V5"
     }
   end
 end
