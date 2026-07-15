@@ -59,8 +59,8 @@ defmodule BaileysExo.ConnectionProcess do
     GenServer.call(connection, {:commit_credentials, base, credentials}, 30_000)
   end
 
-  def commit_history(connection, mappings, progress) do
-    GenServer.call(connection, {:commit_history, mappings, progress}, 30_000)
+  def commit_history(connection, mappings, tokens, progress) do
+    GenServer.call(connection, {:commit_history, mappings, tokens, progress}, 30_000)
   end
 
   @doc false
@@ -349,10 +349,22 @@ defmodule BaileysExo.ConnectionProcess do
     end
   end
 
-  def handle_call({:commit_history, mappings, progress}, _from, state) do
+  def handle_call({:commit_history, mappings, tokens, progress}, _from, state) do
     credentials =
       Enum.reduce(mappings, state.credentials, fn %{pn: pn, lid: lid}, credentials ->
         put_in(credentials.lid_mappings[pn], lid)
+      end)
+
+    credentials =
+      Enum.reduce(tokens, credentials, fn %{jid: jid, token: token, timestamp: timestamp},
+                                          credentials ->
+        current = credentials.privacy_tokens[jid]
+
+        if is_nil(current) or timestamp >= current.timestamp do
+          put_in(credentials.privacy_tokens[jid], %{token: token, timestamp: timestamp})
+        else
+          credentials
+        end
       end)
 
     key =
@@ -593,11 +605,11 @@ defmodule BaileysExo.ConnectionProcess do
   defp handle_node(%Node{tag: "ack", attrs: %{"class" => "message", "id" => id}} = node, state) do
     if node.attrs["error"] do
       timestamp = Receiver.receipt_timestamp(node, receipt_clock(state))
+      recipient = failed_ack_recipient(node, id, state)
 
       send(state.owner, {
         :connection_event,
-        {:message_status, id, node.attrs["from"] || node.attrs["to"], :failed, timestamp,
-         node.attrs}
+        {:message_status, id, recipient, :failed, timestamp, node.attrs}
       })
 
       send(state.owner, {
@@ -605,7 +617,7 @@ defmodule BaileysExo.ConnectionProcess do
         {:messages_update,
          [
            %{
-             key: Receiver.receipt_key(node, id, state.credentials),
+             key: failed_ack_key(node, id, state),
              update: %{status: :failed, timestamp: timestamp, error: node.attrs}
            }
          ]}
@@ -1243,6 +1255,7 @@ defmodule BaileysExo.ConnectionProcess do
 
   defp decrypt_message(node, credentials) do
     with {:ok, context} <- Receiver.context(node, credentials),
+         credentials = prepare_signal_address(context, credentials),
          encrypted when encrypted != [] <- ordered_encrypted_payloads(node),
          {:ok, message, raw_payloads, credentials} <-
            decrypt_payloads(encrypted, context, credentials) do
@@ -1261,6 +1274,44 @@ defmodule BaileysExo.ConnectionProcess do
   rescue
     error -> {:error, error}
   end
+
+  defp prepare_signal_address(context, credentials) do
+    with {pn_source, lid_source} <- signal_address_pair(context),
+         {:ok, pn} <- JID.decode(pn_source),
+         {:ok, lid} <- JID.decode(lid_source),
+         true <- pn_lid_pair?(pn.server, lid.server) do
+      pn_jid = JID.encode(pn.user, pn.server)
+      lid_jid = JID.encode(lid.user, lid.server)
+      pn_address = pn_source |> with_device(lid.device || pn.device) |> normalize_signal_address()
+      lid_address = normalize_signal_address(context.signal_jid)
+
+      sessions =
+        case {credentials.sessions[pn_address], credentials.sessions[lid_address]} do
+          {%{} = session, nil} -> Map.put(credentials.sessions, lid_address, session)
+          _existing -> credentials.sessions
+        end
+
+      %{
+        credentials
+        | lid_mappings: Map.put(credentials.lid_mappings, pn_jid, lid_jid),
+          sessions: sessions
+      }
+    else
+      _not_pn_to_lid -> credentials
+    end
+  end
+
+  defp signal_address_pair(%{key: %{addressing_mode: :pn}} = context),
+    do: {context.wire_sender_jid, context.signal_jid}
+
+  defp signal_address_pair(%{key: %{addressing_mode: :lid} = key} = context),
+    do: {key.participant_alt || key.remote_jid_alt, context.signal_jid}
+
+  defp signal_address_pair(_context), do: nil
+
+  defp pn_lid_pair?("s.whatsapp.net", "lid"), do: true
+  defp pn_lid_pair?("hosted", "hosted.lid"), do: true
+  defp pn_lid_pair?(_pn_server, _lid_server), do: false
 
   defp ordered_encrypted_payloads(node) do
     node
@@ -1831,6 +1882,21 @@ defmodule BaileysExo.ConnectionProcess do
   end
 
   defp receipt_clock(state), do: Map.get(state, :now, &DateTime.utc_now/0)
+
+  defp failed_ack_key(node, id, state) do
+    key = Receiver.receipt_key(node, id, state.credentials)
+
+    case sent_message_recipient(id, state) do
+      recipient when is_binary(recipient) -> %{key | remote_jid: recipient, from_me: true}
+      _missing -> key
+    end
+  end
+
+  defp failed_ack_recipient(node, id, state) do
+    sent_message_recipient(id, state) || node.attrs["from"] || node.attrs["to"]
+  end
+
+  defp sent_message_recipient(id, state), do: get_in(state, [:sent_messages, id, :recipient])
 
   defp remember_sent_message(state, %Node{attrs: %{"id" => id}}, retry_material)
        when is_binary(id) and is_map(retry_material) do

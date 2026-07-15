@@ -148,7 +148,7 @@ defmodule BaileysExo.Client do
   def handle_call(:connect, _from, state), do: start_connection(state)
 
   def handle_call(:disconnect, _from, %{connection: nil} = state) do
-    {:reply, :ok, %{state | status: :disconnected}}
+    {:reply, :ok, state |> cancel_history_pause() |> Map.put(:status, :disconnected)}
   end
 
   def handle_call(:disconnect, _from, state) do
@@ -162,6 +162,7 @@ defmodule BaileysExo.Client do
       end
     end
 
+    state = cancel_history_pause(state)
     {:reply, :ok, %{state | connection: nil, connection_monitor: nil, status: :disconnected}}
   end
 
@@ -175,6 +176,11 @@ defmodule BaileysExo.Client do
       {:ok, _reply} ->
         Process.demonitor(state.connection_monitor, [:flush])
         ConnectionProcess.close(connection)
+
+        state =
+          state
+          |> cancel_history_pause()
+          |> stop_history_worker()
 
         with :ok <- FileStore.reset(state.session_path),
              {:ok, credentials, session_path} <-
@@ -367,8 +373,9 @@ defmodule BaileysExo.Client do
 
   def handle_info(
         {:history_result, reference, result},
-        %{history_worker: {reference, notification}} = state
+        %{history_worker: {reference, notification, _worker, monitor}} = state
       ) do
+    Process.demonitor(monitor, [:flush])
     state = %{state | history_worker: nil}
 
     state =
@@ -376,8 +383,9 @@ defmodule BaileysExo.Client do
         {:ok, history} ->
           history = %{history | latest?: history_latest?(history, state)}
           mappings = Enum.map(history.lid_pn_mappings, &%{lid: &1.lid, pn: &1.pn})
+          tokens = history_privacy_tokens(history, mappings, state)
 
-          case commit_history(state, mappings, history, notification) do
+          case commit_history(state, mappings, tokens, history, notification) do
             :ok ->
               notify(state, {:messaging_history_set, history})
               update_history_status(history, state)
@@ -395,10 +403,15 @@ defmodule BaileysExo.Client do
     {:noreply, start_next_history(state)}
   end
 
-  def handle_info({:history_pause, sync_type}, state) do
+  def handle_info({:history_result, _reference, _result}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:history_pause, sync_type, token},
+        %{history_pause_timer: {_timer, token}} = state
+      ) do
     completed = Map.get(state, :history_completed, MapSet.new())
 
-    if not MapSet.member?(completed, sync_type) and Map.get(state, :history_pause_timer) do
+    if not MapSet.member?(completed, sync_type) do
       notify(state, {
         :messaging_history_status,
         %MessagingHistoryStatus{sync_type: sync_type, status: :paused, explicit?: false}
@@ -407,6 +420,8 @@ defmodule BaileysExo.Client do
 
     {:noreply, %{state | history_pause_timer: nil}}
   end
+
+  def handle_info({:history_pause, _sync_type, _token}, state), do: {:noreply, state}
 
   def handle_info({:connection_event, {:messages_update, updates}}, state) do
     updates =
@@ -451,6 +466,16 @@ defmodule BaileysExo.Client do
   end
 
   def handle_info(
+        {:DOWN, monitor, :process, worker, reason},
+        %{history_worker: {_reference, notification, worker, monitor}} = state
+      ) do
+    state = %{state | history_worker: nil}
+    notify(state, {:error, %Error{message: inspect({:history_worker_failed, reason})}})
+    state = retry_history(notification, state)
+    {:noreply, start_next_history(state)}
+  end
+
+  def handle_info(
         {:DOWN, reference, :process, connection, reason},
         %{connection: connection, connection_monitor: reference} = state
       ) do
@@ -461,7 +486,12 @@ defmodule BaileysExo.Client do
     restart? = state.status == :restarting
     disconnect_reason = if restart?, do: :restart_required, else: :connection_closed
     notify(state, {:disconnected, %Disconnected{reason: disconnect_reason}})
-    state = %{state | connection: nil, connection_monitor: nil, status: :disconnected}
+
+    state =
+      state
+      |> cancel_history_pause()
+      |> Map.merge(%{connection: nil, connection_monitor: nil, status: :disconnected})
+
     if restart?, do: Process.send_after(self(), :reconnect, 500)
     {:noreply, state}
   end
@@ -739,35 +769,36 @@ defmodule BaileysExo.Client do
         client = self()
         downloader = Keyword.get(state.options, :history_downloader, &Download.get/1)
 
-        Task.start(fn ->
-          downloaded =
-            if is_binary(notification.initialHistBootstrapInlinePayload) and
-                 byte_size(notification.initialHistBootstrapInlinePayload) > 0 do
-              {:ok, nil}
-            else
-              downloader.(notification.directPath)
-            end
+        {worker, monitor} =
+          spawn_monitor(fn ->
+            downloaded =
+              if is_binary(notification.initialHistBootstrapInlinePayload) and
+                   byte_size(notification.initialHistBootstrapInlinePayload) > 0 do
+                {:ok, nil}
+              else
+                downloader.(notification.directPath)
+              end
 
-          result =
-            with {:ok, bytes} <- downloaded do
-              HistorySync.process(notification, bytes)
-            end
+            result =
+              with {:ok, bytes} <- downloaded do
+                HistorySync.process(notification, bytes)
+              end
 
-          send(client, {:history_result, reference, result})
-        end)
+            send(client, {:history_result, reference, result})
+          end)
 
         state
         |> Map.put(:history_queue, queue)
-        |> Map.put(:history_worker, {reference, notification})
+        |> Map.put(:history_worker, {reference, notification, worker, monitor})
 
       {:empty, _queue} ->
         state
     end
   end
 
-  defp commit_history(%{connection: connection} = _state, mappings, history, notification)
+  defp commit_history(%{connection: connection} = _state, mappings, tokens, history, notification)
        when is_pid(connection) do
-    ConnectionProcess.commit_history(connection, mappings, %{
+    ConnectionProcess.commit_history(connection, mappings, tokens, %{
       sync_type: history.sync_type,
       progress: history.progress,
       chunk_order: history.chunk_order,
@@ -780,7 +811,25 @@ defmodule BaileysExo.Client do
     :exit, _reason -> {:error, :not_connected}
   end
 
-  defp commit_history(_state, _mappings, _history, _notification), do: {:error, :not_connected}
+  defp commit_history(_state, _mappings, _tokens, _history, _notification),
+    do: {:error, :not_connected}
+
+  defp history_privacy_tokens(history, mappings, state) do
+    persisted = state |> Map.get(:credentials, %{}) |> Map.get(:lid_mappings, %{})
+    mapped_lids = Map.merge(persisted, Map.new(mappings, &{&1.pn, &1.lid}))
+
+    Enum.flat_map(history.conversations, fn conversation ->
+      web = conversation.web_conversation
+      jid = conversation.lid || mapped_lids[conversation.id] || conversation.id
+
+      if is_binary(jid) and is_binary(web.tcToken) and byte_size(web.tcToken) > 0 and
+           is_integer(web.tcTokenTimestamp) do
+        [%{jid: jid, token: web.tcToken, timestamp: web.tcTokenTimestamp}]
+      else
+        []
+      end
+    end)
+  end
 
   defp history_latest?(history, state) do
     progress = state |> Map.get(:credentials, %{}) |> Map.get(:history_sync_progress, %{})
@@ -866,8 +915,9 @@ defmodule BaileysExo.Client do
 
       history.sync_type == :recent ->
         cancel_timer(state.history_pause_timer)
-        timer = Process.send_after(self(), {:history_pause, history.sync_type}, 120_000)
-        %{state | history_pause_timer: timer}
+        token = make_ref()
+        timer = Process.send_after(self(), {:history_pause, history.sync_type, token}, 120_000)
+        %{state | history_pause_timer: {timer, token}}
 
       true ->
         state
@@ -883,7 +933,23 @@ defmodule BaileysExo.Client do
   end
 
   defp cancel_timer(nil), do: :ok
+  defp cancel_timer({timer, _token}), do: Process.cancel_timer(timer)
   defp cancel_timer(timer), do: Process.cancel_timer(timer)
+
+  defp cancel_history_pause(state) do
+    cancel_timer(Map.get(state, :history_pause_timer))
+    Map.put(state, :history_pause_timer, nil)
+  end
+
+  defp stop_history_worker(
+         %{history_worker: {_reference, _notification, worker, monitor}} = state
+       ) do
+    Process.exit(worker, :kill)
+    Process.demonitor(monitor, [:flush])
+    %{state | history_worker: nil}
+  end
+
+  defp stop_history_worker(state), do: state
 
   defp add_subscriber(subscribers, subscriber) do
     Map.put_new_lazy(subscribers, subscriber, fn -> Process.monitor(subscriber) end)

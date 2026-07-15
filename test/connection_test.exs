@@ -89,6 +89,11 @@ defmodule BaileysExo.ConnectionProcessTest do
   end
 
   test "emits failed message acknowledgements with server attributes", %{state: state} do
+    state =
+      Map.put(state, :sent_messages, %{
+        "message-1" => %{recipient: "5521999999999@s.whatsapp.net", text: "fixture"}
+      })
+
     ack = %Node{
       tag: "ack",
       attrs: %{
@@ -102,13 +107,15 @@ defmodule BaileysExo.ConnectionProcessTest do
     assert {:ok, ^state} = ConnectionProcess.dispatch(ack, state)
 
     assert_receive {:connection_event,
-                    {:message_status, "message-1", "s.whatsapp.net", :failed,
+                    {:message_status, "message-1", "5521999999999@s.whatsapp.net", :failed,
                      ~U[2000-01-01 00:00:00Z], error}}
 
     assert error == ack.attrs
 
     assert_receive {:connection_event, {:messages_update, [update]}}
     assert update.key.id == "message-1"
+    assert update.key.remote_jid == "5521999999999@s.whatsapp.net"
+    assert update.key.from_me
     assert update.update.status == :failed
     assert update.update.error == ack.attrs
   end
@@ -1165,6 +1172,81 @@ defmodule BaileysExo.ConnectionProcessTest do
                        type: :notify,
                        request_id: nil
                      }}}
+  end
+
+  test "persists PN to LID mappings and aliases an existing Signal session before decrypt", %{
+    state: state
+  } do
+    pn_address = "5521999999999:3@s.whatsapp.net"
+    lid_address = "9000:3@lid"
+    session = %{sessions: %{}}
+
+    credentials = %{
+      deterministic_credentials(70)
+      | me: %{id: "5511000000000:2@s.whatsapp.net"},
+        sessions: %{pn_address => session}
+    }
+
+    message = %Node{
+      tag: "message",
+      attrs: %{
+        "id" => "pn-lid-migration-1",
+        "from" => pn_address,
+        "sender_lid" => "9000@lid",
+        "t" => "1700000000"
+      },
+      content: [%Node{tag: "enc", attrs: %{"type" => "msg"}, content: <<0>>}]
+    }
+
+    state =
+      state
+      |> Map.put(:credentials, credentials)
+      |> Map.put(:session_path, nil)
+      |> Map.put(:max_retry_count, 0)
+
+    assert {:ok, state} = ConnectionProcess.dispatch(message, state)
+    assert state.credentials.lid_mappings["5521999999999@s.whatsapp.net"] == "9000@lid"
+    assert state.credentials.sessions[lid_address] == session
+  end
+
+  test "aliases PN sessions for LID-addressed and hosted senders", %{state: state} do
+    for {pn_address, lid_address, attrs} <- [
+          {"5521999999999:3@s.whatsapp.net", "9000:3@lid",
+           %{
+             "from" => "9000:3@lid",
+             "sender_pn" => "5521999999999@s.whatsapp.net",
+             "addressing_mode" => "lid"
+           }},
+          {"hosted-user:4@hosted", "hosted-lid:4@hosted.lid",
+           %{"from" => "hosted-user:4@hosted", "sender_lid" => "hosted-lid@hosted.lid"}}
+        ] do
+      session = %{sessions: %{}}
+
+      credentials = %{
+        deterministic_credentials(71)
+        | me: %{id: "5511000000000:2@s.whatsapp.net"},
+          sessions: %{pn_address => session}
+      }
+
+      message = %Node{
+        tag: "message",
+        attrs:
+          Map.merge(
+            %{"id" => "address-migration-#{pn_address}", "t" => "1700000000"},
+            attrs
+          ),
+        content: [%Node{tag: "enc", attrs: %{"type" => "msg"}, content: <<0>>}]
+      }
+
+      state =
+        state
+        |> Map.put(:credentials, credentials)
+        |> Map.put(:session_path, nil)
+        |> Map.put(:max_retry_count, 0)
+
+      assert {:ok, updated} = ConnectionProcess.dispatch(message, state)
+      assert updated.credentials.sessions[lid_address] == session
+    end
   end
 
   test "processes sender-key distributions and decrypts group skmsg", %{state: state} do

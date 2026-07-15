@@ -186,6 +186,7 @@ defmodule BaileysExo.HistorySync do
   defp wrapped_message(message) do
     Enum.find_value(
       [
+        message.deviceSentMessage,
         message.ephemeralMessage,
         message.viewOnceMessage,
         message.documentWithCaptionMessage,

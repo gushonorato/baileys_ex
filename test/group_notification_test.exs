@@ -62,16 +62,22 @@ defmodule BaileysExo.Messages.GroupNotificationTest do
     for {operation, action} <- [
           {"add", :add},
           {"remove", :remove},
+          {"leave", :remove},
+          {"modify", :modify},
           {"promote", :promote},
           {"demote", :demote}
         ] do
       node = notification(%Node{tag: operation, content: [participant]})
 
-      assert {:ok, _envelope, {:group_participants_update, update}} =
+      assert {:ok, envelope, {:group_participants_update, update}} =
                GroupNotification.decode(node, credentials)
 
       assert update.action == action
       assert [%{id: "member@s.whatsapp.net", lid: "member@lid"}] = update.participants
+
+      if operation == "leave" do
+        assert envelope.stub_type == :group_participant_leave
+      end
     end
 
     assert {:ok, subject, {:groups_update, [%{subject: "New Subject"}]}} =
@@ -150,6 +156,19 @@ defmodule BaileysExo.Messages.GroupNotificationTest do
     assert envelope.stub_type == :group_membership_join_request
     assert request.action == :created
     assert request.method == :invite_link
+  end
+
+  test "projects a sole self-removal as leave with remove action", %{credentials: credentials} do
+    operation = %Node{
+      tag: "remove",
+      content: [%Node{tag: "participant", attrs: %{"jid" => "actor@lid"}}]
+    }
+
+    assert {:ok, envelope, {:group_participants_update, update}} =
+             GroupNotification.decode(notification(operation), credentials)
+
+    assert envelope.stub_type == :group_participant_leave
+    assert update.action == :remove
   end
 
   test "projects group effects into typed public events" do

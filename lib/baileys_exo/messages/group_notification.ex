@@ -50,7 +50,13 @@ defmodule BaileysExo.Messages.GroupNotification do
         participants(operation, context, :add)
 
       operation = NodeUtils.child(node, "remove") ->
-        participants(operation, context, :remove)
+        participants(operation, context, :remove, remove_stub(operation, context))
+
+      operation = NodeUtils.child(node, "leave") ->
+        participants(operation, context, :remove, :leave)
+
+      operation = NodeUtils.child(node, "modify") ->
+        participants(operation, context, :modify)
 
       operation = NodeUtils.child(node, "promote") ->
         participants(operation, context, :promote)
@@ -132,7 +138,7 @@ defmodule BaileysExo.Messages.GroupNotification do
     end
   end
 
-  defp participants(operation, context, action) do
+  defp participants(operation, context, action, stub_action \\ nil) do
     participants = Enum.map(NodeUtils.children(operation, "participant"), &participant/1)
 
     if participants == [] do
@@ -147,9 +153,34 @@ defmodule BaileysExo.Messages.GroupNotification do
         action: action
       }
 
-      {:ok, nil, participant_stub(action), participants, {:group_participants_update, update}}
+      {:ok, nil, participant_stub(stub_action || action), participants,
+       {:group_participants_update, update}}
     end
   end
+
+  defp remove_stub(operation, context) do
+    case NodeUtils.children(operation, "participant") do
+      [%Node{attrs: %{"jid" => jid}}] ->
+        if same_account?(jid, context.wire_sender_jid) or
+             same_account?(jid, context.key.participant_alt),
+           do: :leave,
+           else: :remove
+
+      _participants ->
+        :remove
+    end
+  end
+
+  defp same_account?(left, right) when is_binary(left) and is_binary(right) do
+    with {:ok, left} <- BaileysExo.JID.decode(left),
+         {:ok, right} <- BaileysExo.JID.decode(right) do
+      left.user == right.user and left.server == right.server
+    else
+      _invalid -> left == right
+    end
+  end
+
+  defp same_account?(_left, _right), do: false
 
   defp subject(operation, context) do
     value = operation.attrs["subject"]
@@ -290,6 +321,8 @@ defmodule BaileysExo.Messages.GroupNotification do
 
   defp participant_stub(:add), do: :group_participant_add
   defp participant_stub(:remove), do: :group_participant_remove
+  defp participant_stub(:leave), do: :group_participant_leave
+  defp participant_stub(:modify), do: :group_participant_change_number
   defp participant_stub(:promote), do: :group_participant_promote
   defp participant_stub(:demote), do: :group_participant_demote
 

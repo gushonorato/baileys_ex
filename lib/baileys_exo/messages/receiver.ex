@@ -448,8 +448,14 @@ defmodule BaileysExo.Messages.Receiver do
 
   defp signal_jid(:lid, author, _sender_alt, _credentials), do: author
 
-  defp signal_jid(:pn, _author, sender_alt, _credentials) when is_binary(sender_alt),
-    do: sender_alt
+  defp signal_jid(:pn, author, sender_alt, _credentials) when is_binary(sender_alt) do
+    with {:ok, author} <- JID.decode(author),
+         {:ok, sender_alt} <- JID.decode(sender_alt) do
+      JID.encode(sender_alt.user, sender_alt.server, author.device || sender_alt.device)
+    else
+      _invalid -> sender_alt
+    end
+  end
 
   defp signal_jid(:pn, author, _sender_alt, credentials) do
     with {:ok, decoded} <- JID.decode(author),

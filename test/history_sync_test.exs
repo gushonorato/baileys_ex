@@ -78,6 +78,11 @@ defmodule BaileysExo.HistorySyncTest do
 
     assert {:ok, ^notification} = BaileysExo.HistorySync.detect(message)
 
+    assert {:ok, ^notification} =
+             BaileysExo.HistorySync.detect(%Message{
+               deviceSentMessage: %Message.DeviceSentMessage{message: message}
+             })
+
     assert %BaileysExo.Binary.Node{
              tag: "receipt",
              attrs: %{
@@ -245,8 +250,23 @@ defmodule BaileysExo.HistorySyncTest do
         %Conversation{
           id: "111@lid",
           pnJid: "111@s.whatsapp.net",
+          tcToken: "history-token",
+          tcTokenTimestamp: 1_700_000_000,
           messages: [%HistorySyncMsg{message: web_message("history-1", "111@lid", 10)}]
+        },
+        %Conversation{
+          id: "222@s.whatsapp.net",
+          tcToken: "mapped-history-token",
+          tcTokenTimestamp: 1_700_000_001
+        },
+        %Conversation{
+          id: "333@s.whatsapp.net",
+          tcToken: "previously-mapped-token",
+          tcTokenTimestamp: 1_700_000_002
         }
+      ],
+      phoneNumberToLidMappings: [
+        %PhoneNumberToLIDMapping{pnJid: "222@s.whatsapp.net", lidJid: "222@lid"}
       ]
     }
 
@@ -291,6 +311,10 @@ defmodule BaileysExo.HistorySyncTest do
     state = %{
       subscribers: %{self() => make_ref()},
       connection: connection,
+      credentials: %{
+        lid_mappings: %{"333@s.whatsapp.net" => "333@lid"},
+        history_sync_progress: %{}
+      },
       options: [],
       history_queue: :queue.new(),
       history_worker: nil,
@@ -309,8 +333,19 @@ defmodule BaileysExo.HistorySyncTest do
     assert {:noreply, _state} =
              Client.handle_info({:history_result, reference, {:ok, result}}, state)
 
-    assert_receive {:history_commit, mappings, progress}
-    assert mappings == [%{lid: "111@lid", pn: "111@s.whatsapp.net"}]
+    assert_receive {:history_commit, mappings, tokens, progress}
+
+    assert mappings == [
+             %{lid: "222@lid", pn: "222@s.whatsapp.net"},
+             %{lid: "111@lid", pn: "111@s.whatsapp.net"}
+           ]
+
+    assert tokens == [
+             %{jid: "111@lid", token: "history-token", timestamp: 1_700_000_000},
+             %{jid: "222@lid", token: "mapped-history-token", timestamp: 1_700_000_001},
+             %{jid: "333@lid", token: "previously-mapped-token", timestamp: 1_700_000_002}
+           ]
+
     assert progress.request_id == "request-1"
 
     assert_receive {:baileys, _client,
@@ -331,9 +366,10 @@ defmodule BaileysExo.HistorySyncTest do
   end
 
   test "history inactivity emits pause without marking completion" do
-    state = %{subscribers: %{self() => make_ref()}, history_pause_timer: make_ref()}
+    token = make_ref()
+    state = %{subscribers: %{self() => make_ref()}, history_pause_timer: {make_ref(), token}}
 
-    assert {:noreply, updated} = Client.handle_info({:history_pause, :recent}, state)
+    assert {:noreply, updated} = Client.handle_info({:history_pause, :recent, token}, state)
     assert updated.history_pause_timer == nil
 
     assert_receive {:baileys, _client,
@@ -343,6 +379,94 @@ defmodule BaileysExo.HistorySyncTest do
                        status: :paused,
                        explicit?: false
                      }}}
+
+    current = make_ref()
+    state = %{state | history_pause_timer: {make_ref(), current}}
+    assert {:noreply, ^state} = Client.handle_info({:history_pause, :recent, make_ref()}, state)
+  end
+
+  test "disconnect cancels a pending history inactivity timer" do
+    timer = Process.send_after(self(), :unexpected_history_pause, 10_000)
+    state = %{connection: nil, status: :online, history_pause_timer: timer}
+
+    assert {:reply, :ok, updated} = Client.handle_call(:disconnect, self(), state)
+    assert updated.status == :disconnected
+    assert updated.history_pause_timer == nil
+    refute Process.read_timer(timer)
+  end
+
+  test "history downloader crashes release the worker slot" do
+    notification = %Message.HistorySyncNotification{
+      syncType: :RECENT,
+      directPath: "/raise",
+      peerDataRequestSessionId: "crashing-worker"
+    }
+
+    content = %Message{
+      protocolMessage: %Message.ProtocolMessage{
+        type: :HISTORY_SYNC_NOTIFICATION,
+        historySyncNotification: notification
+      }
+    }
+
+    encoded = Protobuf.encode(content)
+
+    envelope = %{
+      key: %{
+        remote_jid: "local@s.whatsapp.net",
+        remote_jid_alt: nil,
+        remote_jid_username: nil,
+        from_me: true,
+        id: "crashing-history-worker",
+        participant: nil,
+        participant_alt: nil,
+        participant_username: nil,
+        addressing_mode: :pn,
+        server_id: nil,
+        view_once?: false
+      },
+      content: content,
+      raw_content: encoded,
+      raw_payloads: [encoded],
+      timestamp: ~U[2023-11-14 22:13:20Z],
+      status: :server_ack,
+      category: nil,
+      push_name: nil,
+      verified_business_name: nil,
+      broadcast: false,
+      offline: true,
+      retry_count: nil
+    }
+
+    state = %{
+      subscribers: %{self() => make_ref()},
+      connection: nil,
+      credentials: %{},
+      options: [history_downloader: fn _path -> raise "download failed" end],
+      status: :disconnected,
+      history_queue: :queue.new(),
+      history_worker: nil,
+      history_pause_timer: nil,
+      history_retries: %{}
+    }
+
+    assert {:noreply, state} =
+             Client.handle_info(
+               {:connection_event, {:messages_upsert, [envelope], :append, nil}},
+               state
+             )
+
+    assert {_reference, ^notification, worker, monitor} = state.history_worker
+    assert_receive {:DOWN, ^monitor, :process, ^worker, {%RuntimeError{}, stacktrace}}
+
+    assert {:noreply, updated} =
+             Client.handle_info(
+               {:DOWN, monitor, :process, worker, {%RuntimeError{}, stacktrace}},
+               state
+             )
+
+    assert updated.history_worker == nil
+    assert_receive {:baileys, _client, {:error, %Baileys.Error{}}}
   end
 
   defp web_message(id, jid, timestamp, status \\ :SERVER_ACK, text \\ "message", extra \\ %{}) do
@@ -409,8 +533,8 @@ defmodule BaileysExo.HistorySyncTest do
 
   defp commit_loop(test) do
     receive do
-      {:"$gen_call", from, {:commit_history, mappings, progress}} ->
-        send(test, {:history_commit, mappings, progress})
+      {:"$gen_call", from, {:commit_history, mappings, tokens, progress}} ->
+        send(test, {:history_commit, mappings, tokens, progress})
         GenServer.reply(from, :ok)
         commit_loop(test)
     end
