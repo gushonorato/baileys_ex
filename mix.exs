@@ -24,13 +24,18 @@ defmodule Baileys.MixProject do
   defp deps do
     [
       {:castore, "~> 1.0"},
-      {:ex_aws, "~> 2.7"},
+      {:ex_aws, "~> 2.6"},
       {:ex_aws_s3, "~> 2.5"},
       {:jason, "~> 1.4"},
       {:mint, "~> 1.7"},
       {:mint_web_socket, "~> 1.0"},
       {:protobuf, "~> 0.17"},
       {:qr_code, "~> 3.2"},
+      # Remove the override after iodevs/matrix_reloaded#18 is released.
+      {:matrix_reloaded,
+       github: "peaceful-james/matrix_reloaded",
+       ref: "dc4fcb1698ff2aad273632696eadf78334c1541d",
+       override: true},
       {:req, "~> 0.6.0"}
     ]
   end
