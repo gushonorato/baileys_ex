@@ -42,6 +42,29 @@ defmodule Baileys.Protocol.PairingTest do
     assert String.ends_with?(payload, ",1")
   end
 
+  test "uses the Windows desktop identity for full-history pairing" do
+    credentials = Credentials.new()
+    options = [browser: :windows_desktop, sync_full_history: true]
+
+    assert {:ok, "ABCD1234", node, _updated} =
+             Pairing.request_code(
+               credentials,
+               "+55 (11) 99999-9999",
+               "ABCD1234",
+               options
+             )
+
+    registration = NodeUtils.child(node, "link_code_companion_reg")
+
+    assert %Node{content: {:text, "8"}} =
+             NodeUtils.child(registration, "companion_platform_id")
+
+    assert %Node{content: {:text, "Desktop (Windows)"}} =
+             NodeUtils.child(registration, "companion_platform_display")
+
+    assert Pairing.qr_payload("reference", credentials, options) |> String.ends_with?(",8")
+  end
+
   test "rejects invalid phone numbers and custom codes" do
     credentials = Credentials.new()
 

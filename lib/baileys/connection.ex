@@ -291,7 +291,7 @@ defmodule Baileys.ConnectionProcess do
 
   def handle_call({:pairing_code, phone, custom_code}, _from, %{phase: :transport} = state) do
     with {:ok, code, node, credentials} <-
-           Pairing.request_code(state.credentials, phone, custom_code),
+           Pairing.request_code(state.credentials, phone, custom_code, state.options),
          :ok <- persist_credentials(state.store, credentials),
          {:ok, state} <- send_node(node, %{state | credentials: credentials}) do
       send(state.owner, {:connection_event, {:credentials, credentials}})
@@ -1243,7 +1243,7 @@ defmodule Baileys.ConnectionProcess do
   defp emit_next_qr(%{qr_refs: []} = state), do: state
 
   defp emit_next_qr(%{qr_refs: [reference | refs]} = state) do
-    payload = Pairing.qr_payload(reference, state.credentials)
+    payload = Pairing.qr_payload(reference, state.credentials, state.options)
 
     send(state.owner, {:connection_event, {:qr, payload}})
     timeout = if state.qr_count == 0, do: 60_000, else: 20_000

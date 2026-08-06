@@ -40,6 +40,7 @@ defmodule Baileys.Client do
   alias Baileys.HistorySync
   alias Baileys.Media.Download
   alias Baileys.Messages.Sender
+  alias Baileys.Protocol.Browser
   alias Baileys.Store
 
   def start_link(options) do
@@ -96,6 +97,7 @@ defmodule Baileys.Client do
     session = Keyword.get(options, :session, "default")
 
     with :ok <- validate_session(session),
+         {:ok, _browser} <- Browser.resolve(options),
          {:ok, store_config} <- fetch_store(options),
          {:ok, credentials, store} <- Store.open(store_config, session) do
       owner = Keyword.fetch!(options, :owner)

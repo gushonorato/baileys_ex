@@ -170,6 +170,44 @@ defmodule BaileysTest do
              )
   end
 
+  test "validates and forwards full-history browser options" do
+    assert {:error, :invalid_browser} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               browser: :retired_desktop,
+               store: {Baileys.Store.Memory, []}
+             )
+
+    assert {:error, :sync_full_history_requires_windows_desktop} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               sync_full_history: true,
+               store: {Baileys.Store.Memory, []}
+             )
+
+    assert {:error, :invalid_sync_full_history} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               browser: :windows_desktop,
+               sync_full_history: :yes,
+               store: {Baileys.Store.Memory, []}
+             )
+
+    assert {:ok, server} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               browser: :windows_desktop,
+               sync_full_history: true,
+               store: {Baileys.Store.Memory, []}
+             )
+
+    client = :sys.get_state(server).client
+    options = :sys.get_state(client).options
+    assert options[:browser] == :windows_desktop
+    assert options[:sync_full_history] == true
+    GenServer.stop(server)
+  end
+
   test "reset_session stops the current connection and installs fresh credentials" do
     assert {:ok, server} =
              Baileys.start_link(BaileysTest.Handler, self(),

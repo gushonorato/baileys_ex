@@ -5,6 +5,7 @@ defmodule Baileys.Protocol.Pairing do
   alias Baileys.Binary.{Node, NodeUtils}
   alias Baileys.{Crypto, JID}
   alias Baileys.Crypto.XEdDSA
+  alias Baileys.Protocol.Browser
   alias Baileys.Proto.{ADVDeviceIdentity, ADVSignedDeviceIdentity}
   alias Baileys.Proto.ADVSignedDeviceIdentityHMAC
 
@@ -12,9 +13,10 @@ defmodule Baileys.Protocol.Pairing do
   @device_signature_prefix <<6, 1>>
   @hosted_account_signature_prefix <<6, 5>>
   @crockford_alphabet "123456789ABCDEFGHJKLMNPQRSTVWXYZ"
-  @companion_platform_id "1"
+  def qr_payload(reference, %Credentials{} = credentials, options \\ [])
+      when is_binary(reference) do
+    browser = Browser.resolve!(options)
 
-  def qr_payload(reference, %Credentials{} = credentials) when is_binary(reference) do
     "https://wa.me/settings/linked_devices#" <>
       Enum.join(
         [
@@ -22,13 +24,14 @@ defmodule Baileys.Protocol.Pairing do
           Base.encode64(credentials.noise_key.public),
           Base.encode64(credentials.signed_identity_key.public),
           Base.encode64(credentials.adv_secret_key),
-          @companion_platform_id
+          browser.companion_platform_id
         ],
         ","
       )
   end
 
-  def request_code(%Credentials{} = credentials, phone, custom_code \\ nil) do
+  def request_code(%Credentials{} = credentials, phone, custom_code \\ nil, options \\ []) do
+    browser = Browser.resolve!(options)
     code = custom_code || random_pairing_code()
 
     with :ok <- validate_code(code),
@@ -61,8 +64,14 @@ defmodule Baileys.Protocol.Pairing do
                 content: salt <> iv <> wrapped
               },
               %Node{tag: "companion_server_auth_key_pub", content: credentials.noise_key.public},
-              %Node{tag: "companion_platform_id", content: {:text, @companion_platform_id}},
-              %Node{tag: "companion_platform_display", content: {:text, "Chrome (Mac OS)"}},
+              %Node{
+                tag: "companion_platform_id",
+                content: {:text, browser.companion_platform_id}
+              },
+              %Node{
+                tag: "companion_platform_display",
+                content: {:text, "#{browser.name} (#{browser.os})"}
+              },
               %Node{tag: "link_code_pairing_nonce", content: {:text, "0"}}
             ]
           }

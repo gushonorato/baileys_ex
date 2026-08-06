@@ -52,6 +52,11 @@ defmodule Baileys do
 
   `:store` accepts an adapter/options tuple. Existing `:sessions_path`
   configurations remain supported as shorthand for `Baileys.Store.File`.
+
+  New sessions use the `:web` browser profile by default. To request complete
+  history during pairing, pass both `browser: :windows_desktop` and
+  `sync_full_history: true`. This advertises the supported `WIN_HYBRID`
+  sub-platform; the retired `WIN32` value is never emitted.
   """
   @spec start_link(module(), term(), keyword()) :: GenServer.on_start()
   def start_link(module, init_arg, options \\ []) when is_atom(module) and is_list(options) do

@@ -8,7 +8,14 @@ defmodule Baileys.Server do
   alias Baileys.Store
 
   @gen_server_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
-  @client_options [:session, :store, :sessions_path, :request_timeout]
+  @client_options [
+    :session,
+    :store,
+    :sessions_path,
+    :request_timeout,
+    :browser,
+    :sync_full_history
+  ]
 
   def start_link(module, init_arg, options) do
     with :ok <- validate_store(options) do

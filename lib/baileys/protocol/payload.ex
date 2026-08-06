@@ -3,15 +3,18 @@ defmodule Baileys.Protocol.Payload do
 
   alias Baileys.Auth.Credentials
   alias Baileys.JID
+  alias Baileys.Protocol.Browser
   alias Baileys.Proto.{ClientPayload, DeviceProps}
 
   @version [2, 3000, 1_043_857_760]
 
   def registration(%Credentials{} = credentials, options \\ []) do
+    browser = Browser.resolve!(options)
+
     device_props = %DeviceProps{
-      os: Keyword.get(options, :os, "Mac OS"),
-      platformType: :CHROME,
-      requireFullSync: false,
+      os: browser.os,
+      platformType: browser.platform_type,
+      requireFullSync: browser.sync_full_history?,
       version: %DeviceProps.AppVersion{primary: 10, secondary: 15, tertiary: 7},
       historySyncConfig: %DeviceProps.HistorySyncConfig{
         storageQuotaMb: 10_240,
@@ -30,7 +33,7 @@ defmodule Baileys.Protocol.Payload do
 
     signed_pre_key = credentials.signed_pre_key
 
-    base_payload(options)
+    base_payload(options, browser)
     |> Map.merge(%{
       passive: false,
       pull: false,
@@ -50,8 +53,9 @@ defmodule Baileys.Protocol.Payload do
 
   def login(%Credentials{me: %{id: jid}} = _credentials, options \\ []) do
     {:ok, decoded} = JID.decode(jid)
+    browser = Browser.resolve!(options)
 
-    base_payload(options)
+    base_payload(options, browser)
     |> Map.merge(%{
       passive: true,
       pull: true,
@@ -64,7 +68,7 @@ defmodule Baileys.Protocol.Payload do
 
   def version, do: @version
 
-  defp base_payload(options) do
+  defp base_payload(options, browser) do
     %{
       connectType: :WIFI_UNKNOWN,
       connectReason: :USER_ACTIVATED,
@@ -85,7 +89,7 @@ defmodule Baileys.Protocol.Payload do
         mnc: "000",
         mcc: "000"
       },
-      webInfo: %ClientPayload.WebInfo{webSubPlatform: :WEB_BROWSER}
+      webInfo: %ClientPayload.WebInfo{webSubPlatform: browser.web_sub_platform}
     }
   end
 

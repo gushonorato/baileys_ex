@@ -172,6 +172,26 @@ new session; HTTP 403 remains an authorization error.
 The executable example renders the QR directly in the terminal using a
 pure-Elixir QR encoder.
 
+### Full history synchronization
+
+The default `:web` profile requests the normal browser history. To ask WhatsApp
+for complete history while linking a new session, use the supported Windows
+Desktop identity:
+
+```elixir
+Baileys.start_link(MyWhatsApp, init_arg,
+  session: "full-history",
+  store: {Baileys.Store.File, root: "/var/lib/baileys"},
+  browser: :windows_desktop,
+  sync_full_history: true
+)
+```
+
+This sets `DeviceProps.requireFullSync` and advertises `WIN_HYBRID`. Baileys
+never advertises the retired `WIN32` sub-platform. Configure these options
+before the initial QR or pairing-code flow; changing them on an already linked
+session does not cause WhatsApp to resend its initial history.
+
 ## Pairing Code
 
 Request a code after connecting:
