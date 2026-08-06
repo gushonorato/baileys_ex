@@ -10,18 +10,18 @@ if [ "$ACTUAL_PROTOC" != "$EXPECTED_PROTOC" ]; then
   exit 1
 fi
 
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/baileys-exo-proto.XXXXXX")
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/baileys-proto.XXXXXX")
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 export WA_PROTO_SOURCE="$ROOT/proto/WAProto.proto"
 export WA_PROTO_TARGET="$TMP_DIR/WAProto.proto"
 elixir "$ROOT/scripts/normalize_wa_proto.exs"
 
-mkdir -p "$ROOT/lib/baileys_exo/proto/generated"
+mkdir -p "$ROOT/lib/baileys/proto/generated"
 protoc \
   -I "$TMP_DIR" \
   --plugin=protoc-gen-elixir="$ROOT/deps/protobuf/protoc-gen-elixir" \
-  --elixir_out=package_prefix=baileys_exo:"$ROOT/lib/baileys_exo/proto/generated" \
+  --elixir_out=package_prefix=baileys:"$ROOT/lib/baileys/proto/generated" \
   "$TMP_DIR/WAProto.proto"
 
-mix format "$ROOT/lib/baileys_exo/proto/generated/baileys_exo/proto/WAProto.pb.ex"
+mix format "$ROOT/lib/baileys/proto/generated/baileys/proto/WAProto.pb.ex"

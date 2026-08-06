@@ -1,10 +1,10 @@
-defmodule BaileysExo.Messages.ReceiverTest do
+defmodule Baileys.Messages.ReceiverTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.Node
-  alias BaileysExo.Messages.Receiver
-  alias BaileysExo.Proto.Message
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.Node
+  alias Baileys.Messages.Receiver
+  alias Baileys.Proto.Message
 
   setup do
     credentials = %Credentials{

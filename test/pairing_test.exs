@@ -1,9 +1,9 @@
-defmodule BaileysExo.Protocol.PairingTest do
+defmodule Baileys.Protocol.PairingTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.{Codec, Node, NodeUtils}
-  alias BaileysExo.Protocol.Pairing
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.{Codec, Node, NodeUtils}
+  alias Baileys.Protocol.Pairing
 
   test "builds an eight-character pairing-code request" do
     credentials = Credentials.new()

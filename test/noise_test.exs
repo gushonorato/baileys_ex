@@ -1,7 +1,7 @@
-defmodule BaileysExo.NoiseTest do
+defmodule Baileys.NoiseTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Noise
+  alias Baileys.Noise
 
   test "uses the 32-byte Noise protocol name directly as the initial hash" do
     public_key = :binary.copy(<<1>>, 32)

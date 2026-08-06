@@ -1,7 +1,7 @@
-defmodule BaileysExo.ProtobufTest do
+defmodule Baileys.ProtobufTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Proto.{HandshakeMessage, Message}
+  alias Baileys.Proto.{HandshakeMessage, Message}
 
   @fixture_dir Path.expand("fixtures/protobuf", __DIR__)
 

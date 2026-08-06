@@ -1,9 +1,9 @@
-defmodule BaileysExo.Messages.SenderTest do
+defmodule Baileys.Messages.SenderTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.{Node, NodeUtils}
-  alias BaileysExo.Messages.Sender
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.{Node, NodeUtils}
+  alias Baileys.Messages.Sender
 
   test "direct message relay does not put phash on the outer stanza" do
     participant = {"5511999999999@s.whatsapp.net", :msg, <<1, 2, 3>>}

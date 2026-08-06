@@ -1,11 +1,11 @@
-defmodule BaileysExo.Messages.EnvelopeTest do
+defmodule Baileys.Messages.EnvelopeTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.Node
-  alias BaileysExo.Client
-  alias BaileysExo.Messages.Receiver
-  alias BaileysExo.Proto.{Message, VerifiedNameCertificate}
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.Node
+  alias Baileys.Client
+  alias Baileys.Messages.Receiver
+  alias Baileys.Proto.{Message, VerifiedNameCertificate}
 
   setup do
     credentials = %Credentials{

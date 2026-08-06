@@ -1,5 +1,5 @@
 alias Baileys.{Message, MessageKey, MessagingHistorySet}
-alias BaileysExo.Proto.Message, as: ProtoMessage
+alias Baileys.Proto.Message, as: ProtoMessage
 
 iterations = String.to_integer(System.get_env("BENCH_ITERATIONS") || "1000")
 

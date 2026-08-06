@@ -1,11 +1,11 @@
-defmodule BaileysExo.HistorySyncTest do
+defmodule Baileys.HistorySyncTest do
   use ExUnit.Case, async: true
 
   alias Baileys.{HistoryConversation, HistoryPastParticipants, LIDMapping, MessagingHistorySet}
-  alias BaileysExo.Crypto
-  alias BaileysExo.Client
+  alias Baileys.Crypto
+  alias Baileys.Client
 
-  alias BaileysExo.Proto.{
+  alias Baileys.Proto.{
     Conversation,
     HistorySync,
     HistorySyncMsg,
@@ -76,14 +76,14 @@ defmodule BaileysExo.HistorySyncTest do
       }
     }
 
-    assert {:ok, ^notification} = BaileysExo.HistorySync.detect(message)
+    assert {:ok, ^notification} = Baileys.HistorySync.detect(message)
 
     assert {:ok, ^notification} =
-             BaileysExo.HistorySync.detect(%Message{
+             Baileys.HistorySync.detect(%Message{
                deviceSentMessage: %Message.DeviceSentMessage{message: message}
              })
 
-    assert %BaileysExo.Binary.Node{
+    assert %Baileys.Binary.Node{
              tag: "receipt",
              attrs: %{
                "id" => "history-notification",
@@ -91,13 +91,13 @@ defmodule BaileysExo.HistorySyncTest do
                "type" => "hist_sync"
              }
            } =
-             BaileysExo.HistorySync.receipt(%{
+             Baileys.HistorySync.receipt(%{
                content: message,
                key: %{from_me: true, id: "history-notification"},
                wire_sender_jid: "local:2@s.whatsapp.net"
              })
 
-    assert {:ok, %MessagingHistorySet{} = result} = BaileysExo.HistorySync.process(message)
+    assert {:ok, %MessagingHistorySet{} = result} = Baileys.HistorySync.process(message)
 
     assert Enum.map(result.conversations, & &1.id) == ["111@lid", "group@g.us"]
 
@@ -164,7 +164,7 @@ defmodule BaileysExo.HistorySyncTest do
       ]
     }
 
-    assert {:ok, result} = history |> notification() |> BaileysExo.HistorySync.process()
+    assert {:ok, result} = history |> notification() |> Baileys.HistorySync.process()
 
     assert Enum.map(result.contacts, &{&1.id, &1.notify}) == [
              {"first@s.whatsapp.net", "First"},
@@ -186,8 +186,8 @@ defmodule BaileysExo.HistorySyncTest do
     compressed = history |> Protobuf.encode() |> :zlib.compress()
     {blob, notification} = encrypted_blob(compressed)
 
-    assert {:ok, ^compressed} = BaileysExo.HistorySync.decrypt_remote_blob(blob, notification)
-    assert {:ok, result} = BaileysExo.HistorySync.process(notification, blob)
+    assert {:ok, ^compressed} = Baileys.HistorySync.decrypt_remote_blob(blob, notification)
+    assert {:ok, result} = Baileys.HistorySync.process(notification, blob)
     assert Enum.map(result.messages, & &1.key.id) == ["remote"]
   end
 
@@ -198,18 +198,18 @@ defmodule BaileysExo.HistorySyncTest do
     tampered = <<Bitwise.bxor(first, 1), rest::binary>>
 
     assert {:error, :encrypted_sha256_mismatch} =
-             BaileysExo.HistorySync.decrypt_remote_blob(tampered, notification)
+             Baileys.HistorySync.decrypt_remote_blob(tampered, notification)
 
     hmac_notification = %{notification | fileEncSha256: Crypto.sha256(tampered)}
 
     assert {:error, :hmac_mismatch} =
-             BaileysExo.HistorySync.decrypt_remote_blob(tampered, hmac_notification)
+             Baileys.HistorySync.decrypt_remote_blob(tampered, hmac_notification)
 
     assert {:error, :length_mismatch} =
-             BaileysExo.HistorySync.decrypt_remote_blob(blob, %{notification | fileLength: 1})
+             Baileys.HistorySync.decrypt_remote_blob(blob, %{notification | fileLength: 1})
 
     assert {:error, :plaintext_sha256_mismatch} =
-             BaileysExo.HistorySync.decrypt_remote_blob(blob, %{
+             Baileys.HistorySync.decrypt_remote_blob(blob, %{
                notification
                | fileSha256: :binary.copy(<<0>>, 32)
              })
@@ -227,18 +227,18 @@ defmodule BaileysExo.HistorySyncTest do
     }
 
     assert {:error, :invalid_padding} =
-             BaileysExo.HistorySync.decrypt_remote_blob(
+             Baileys.HistorySync.decrypt_remote_blob(
                invalid_blob,
                invalid_padding_notification
              )
   end
 
   test "returns bounded errors for non-history messages and malformed inline payloads" do
-    assert :ignore = BaileysExo.HistorySync.detect(%Message{conversation: "ordinary"})
-    assert {:error, :not_history_sync} = BaileysExo.HistorySync.process(%Message{})
+    assert :ignore = Baileys.HistorySync.detect(%Message{conversation: "ordinary"})
+    assert {:error, :not_history_sync} = Baileys.HistorySync.process(%Message{})
 
     assert {:error, :invalid_compressed_history} =
-             BaileysExo.HistorySync.process(%Message.HistorySyncNotification{
+             Baileys.HistorySync.process(%Message.HistorySyncNotification{
                initialHistBootstrapInlinePayload: "not-zlib"
              })
   end

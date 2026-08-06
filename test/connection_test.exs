@@ -1,15 +1,15 @@
-defmodule BaileysExo.ConnectionProcessTest do
+defmodule Baileys.ConnectionProcessTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.{Node, NodeUtils}
-  alias BaileysExo.Client
-  alias BaileysExo.ConnectionProcess
-  alias BaileysExo.Crypto.XEdDSA
-  alias BaileysExo.Messages.Sender
-  alias BaileysExo.Proto.{ADVSignedDeviceIdentity, Message}
-  alias BaileysExo.Signal.{SenderKey, SessionBuilder, SessionCipher}
-  alias BaileysExo.{Crypto, Protocol.Pairing}
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.{Node, NodeUtils}
+  alias Baileys.Client
+  alias Baileys.ConnectionProcess
+  alias Baileys.Crypto.XEdDSA
+  alias Baileys.Messages.Sender
+  alias Baileys.Proto.{ADVSignedDeviceIdentity, Message}
+  alias Baileys.Signal.{SenderKey, SessionBuilder, SessionCipher}
+  alias Baileys.{Crypto, Protocol.Pairing}
 
   setup do
     test_pid = self()

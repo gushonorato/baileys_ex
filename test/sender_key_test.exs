@@ -1,7 +1,7 @@
-defmodule BaileysExo.Signal.SenderKeyTest do
+defmodule Baileys.Signal.SenderKeyTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Signal.SenderKey
+  alias Baileys.Signal.SenderKey
 
   test "processes a distribution and decrypts a signed group message" do
     sending = sending_record(1)

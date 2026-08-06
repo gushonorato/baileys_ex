@@ -7,7 +7,7 @@ peak_mailbox =
     update = %{id: "synthetic-#{sequence}", img_url: :changed}
 
     {:noreply, ^state} =
-      BaileysExo.Client.handle_info({:connection_event, {:contacts_update, [update]}}, state)
+      Baileys.Client.handle_info({:connection_event, {:contacts_update, [update]}}, state)
 
     {:message_queue_len, length} = Process.info(self(), :message_queue_len)
     max(maximum, length)

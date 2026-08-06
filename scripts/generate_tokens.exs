@@ -49,7 +49,7 @@ if current != [] or length(double) != 4 or length(single) < 200 do
 end
 
 contents = """
-defmodule BaileysExo.Binary.TokenDictionary do
+defmodule Baileys.Binary.TokenDictionary do
   @moduledoc false
 
   @single #{inspect(single, limit: :infinity, printable_limit: :infinity)}
@@ -77,6 +77,6 @@ defmodule BaileysExo.Binary.TokenDictionary do
 end
 """
 
-output = Path.expand("../lib/baileys_exo/binary/token_dictionary.ex", __DIR__)
+output = Path.expand("../lib/baileys/binary/token_dictionary.ex", __DIR__)
 File.mkdir_p!(Path.dirname(output))
 File.write!(output, contents |> Code.format_string!() |> IO.iodata_to_binary())

@@ -1,8 +1,8 @@
-defmodule BaileysExo.CryptoTest do
+defmodule Baileys.CryptoTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Crypto
-  alias BaileysExo.Crypto.XEdDSA
+  alias Baileys.Crypto
+  alias Baileys.Crypto.XEdDSA
 
   test "implements RFC 5869 HKDF-SHA256 vector 1" do
     input = :binary.copy(<<0x0B>>, 22)

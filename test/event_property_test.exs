@@ -1,8 +1,8 @@
-defmodule BaileysExo.EventPropertyTest do
+defmodule Baileys.EventPropertyTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Binary.{Codec, Node}
-  alias BaileysExo.Proto.{Message, MessageContextInfo}
+  alias Baileys.Binary.{Codec, Node}
+  alias Baileys.Proto.{Message, MessageContextInfo}
 
   test "synthetic protobuf messages round trip across varied binary payloads" do
     :rand.seed(:exsss, {17, 23, 41})

@@ -1,8 +1,8 @@
-defmodule BaileysExo.CallsTest do
+defmodule Baileys.CallsTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Binary.Node
-  alias BaileysExo.Calls
+  alias Baileys.Binary.Node
+  alias Baileys.Calls
 
   test "maps call lifecycle statuses and relay latency" do
     for {child, status} <- [

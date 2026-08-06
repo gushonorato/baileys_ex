@@ -1,9 +1,9 @@
-defmodule BaileysExo.SignalTest do
+defmodule Baileys.SignalTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Crypto
-  alias BaileysExo.Signal.{SessionBuilder, SessionCipher}
+  alias Baileys.Auth.Credentials
+  alias Baileys.Crypto
+  alias Baileys.Signal.{SessionBuilder, SessionCipher}
 
   test "establishes X3DH and decrypts the first pre-key message" do
     alice = Credentials.new()

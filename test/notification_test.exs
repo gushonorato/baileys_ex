@@ -1,10 +1,10 @@
-defmodule BaileysExo.Messages.NotificationTest do
+defmodule Baileys.Messages.NotificationTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.Node
-  alias BaileysExo.Client
-  alias BaileysExo.Messages.Notification
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.Node
+  alias Baileys.Client
+  alias Baileys.Messages.Notification
 
   setup do
     %{credentials: %Credentials{me: %{id: "local-user:2@s.whatsapp.net"}}}

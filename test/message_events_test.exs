@@ -1,9 +1,9 @@
-defmodule BaileysExo.MessageEventsTest do
+defmodule Baileys.MessageEventsTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Client
-  alias BaileysExo.Proto.{Message, MessageKey}
+  alias Baileys.Auth.Credentials
+  alias Baileys.Client
+  alias Baileys.Proto.{Message, MessageKey}
 
   test "emits reactions with separate target and author keys" do
     target = %MessageKey{

@@ -1,9 +1,9 @@
-defmodule BaileysExo.MixProject do
+defmodule Baileys.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :baileys_exo,
+      app: :baileys,
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
@@ -16,7 +16,7 @@ defmodule BaileysExo.MixProject do
   def application do
     [
       extra_applications: [:crypto, :logger, :ssl],
-      mod: {BaileysExo.Application, []}
+      mod: {Baileys.Application, []}
     ]
   end
 
@@ -37,7 +37,7 @@ defmodule BaileysExo.MixProject do
       "proto.generate": "cmd scripts/generate_protobuf.sh",
       "proto.check": [
         "proto.generate",
-        "cmd git diff --exit-code -- proto lib/baileys_exo/proto/generated"
+        "cmd git diff --exit-code -- proto lib/baileys/proto/generated"
       ]
     ]
   end

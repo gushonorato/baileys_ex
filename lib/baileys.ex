@@ -13,7 +13,7 @@ defmodule Baileys do
   Events are delivered to `c:handle_event/2` as `%Baileys.Event{}` values.
   """
 
-  alias BaileysExo.Server
+  alias Baileys.Server
 
   @type callback_state :: term()
   @type event :: Baileys.Event.t()

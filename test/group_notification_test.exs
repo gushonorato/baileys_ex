@@ -1,10 +1,10 @@
-defmodule BaileysExo.Messages.GroupNotificationTest do
+defmodule Baileys.Messages.GroupNotificationTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.Node
-  alias BaileysExo.Client
-  alias BaileysExo.Messages.GroupNotification
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.Node
+  alias Baileys.Client
+  alias Baileys.Messages.GroupNotification
 
   setup do
     credentials = %Credentials{

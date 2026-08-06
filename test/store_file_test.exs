@@ -1,10 +1,10 @@
-defmodule BaileysExo.Store.FileTest do
+defmodule Baileys.Store.FileTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Proto.{ADVSignedDeviceIdentity, Message}
-  alias BaileysExo.Signal.SenderKey
-  alias BaileysExo.Store.File, as: FileStore
+  alias Baileys.Auth.Credentials
+  alias Baileys.Proto.{ADVSignedDeviceIdentity, Message}
+  alias Baileys.Signal.SenderKey
+  alias Baileys.Store.File, as: FileStore
 
   test "round trips credentials through versioned JSON" do
     root = temporary_root()

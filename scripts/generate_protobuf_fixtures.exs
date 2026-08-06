@@ -1,4 +1,4 @@
-alias BaileysExo.Proto.{ContextInfo, Message, MessageKey}
+alias Baileys.Proto.{ContextInfo, Message, MessageKey}
 
 key = %MessageKey{
   remoteJid: "fixture-user-1@s.whatsapp.net",

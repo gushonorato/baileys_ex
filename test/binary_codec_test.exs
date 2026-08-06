@@ -1,7 +1,7 @@
-defmodule BaileysExo.Binary.CodecTest do
+defmodule Baileys.Binary.CodecTest do
   use ExUnit.Case, async: true
 
-  alias BaileysExo.Binary.{Codec, Node, TokenDictionary}
+  alias Baileys.Binary.{Codec, Node, TokenDictionary}
 
   test "contains the complete token dictionary snapshot" do
     assert length(TokenDictionary.single()) == 236

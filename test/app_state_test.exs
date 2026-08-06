@@ -1,15 +1,15 @@
-defmodule BaileysExo.AppStateTest do
+defmodule Baileys.AppStateTest do
   use ExUnit.Case, async: true
 
   import Bitwise
 
-  alias BaileysExo.AppState.{Crypto, Decoder}
-  alias BaileysExo.AppState
-  alias BaileysExo.Auth.Credentials
-  alias BaileysExo.Binary.{Node, NodeUtils}
-  alias BaileysExo.Crypto, as: CoreCrypto
+  alias Baileys.AppState.{Crypto, Decoder}
+  alias Baileys.AppState
+  alias Baileys.Auth.Credentials
+  alias Baileys.Binary.{Node, NodeUtils}
+  alias Baileys.Crypto, as: CoreCrypto
 
-  alias BaileysExo.Proto.{
+  alias Baileys.Proto.{
     KeyId,
     Message,
     SyncActionData,
