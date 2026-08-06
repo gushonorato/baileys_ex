@@ -17,12 +17,10 @@ export WA_PROTO_SOURCE="$ROOT/proto/WAProto.proto"
 export WA_PROTO_TARGET="$TMP_DIR/WAProto.proto"
 elixir "$ROOT/scripts/normalize_wa_proto.exs"
 
-PROTOBUF_DIR="$ROOT/deps/protobuf"
-(
-  cd "$PROTOBUF_DIR"
-  MIX_ENV=prod mix escript.build
-)
-PROTOC_GEN_ELIXIR="$PROTOBUF_DIR/protoc-gen-elixir"
+PROTOBUF_VERSION="0.17.0"
+mix escript.install hex protobuf "$PROTOBUF_VERSION" --force
+ESCRIPTS_DIR=$(elixir -e 'Mix.start(); IO.write(Mix.path_for(:escripts))')
+PROTOC_GEN_ELIXIR="$ESCRIPTS_DIR/protoc-gen-elixir"
 
 mkdir -p "$ROOT/lib/baileys/proto/generated"
 protoc \
