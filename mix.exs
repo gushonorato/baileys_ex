@@ -30,11 +30,12 @@ defmodule Baileys.MixProject do
       {:mint, "~> 1.7"},
       {:mint_web_socket, "~> 1.0"},
       {:protobuf, "~> 0.17"},
-      {:qr_code, "~> 3.2"},
+      {:qr_code, "~> 3.2", only: :dev},
       # Remove the override after iodevs/matrix_reloaded#18 is released.
       {:matrix_reloaded,
        github: "peaceful-james/matrix_reloaded",
        ref: "dc4fcb1698ff2aad273632696eadf78334c1541d",
+       only: :dev,
        override: true},
       {:req, "~> 0.6.0"}
     ]
