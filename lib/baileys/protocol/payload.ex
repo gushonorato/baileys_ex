@@ -5,7 +5,7 @@ defmodule Baileys.Protocol.Payload do
   alias Baileys.JID
   alias Baileys.Proto.{ClientPayload, DeviceProps}
 
-  @version [2, 3000, 1_035_194_821]
+  @version [2, 3000, 1_043_857_760]
 
   def registration(%Credentials{} = credentials, options \\ []) do
     device_props = %DeviceProps{
