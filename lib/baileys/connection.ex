@@ -16,7 +16,7 @@ defmodule Baileys.ConnectionProcess do
   alias Baileys.Messages.{GroupNotification, Notification, Receiver, Sender}
   alias Baileys.Signal.{SenderKey, SessionCipher}
   alias Baileys.Signal.PreKeys
-  alias Baileys.Store.File, as: FileStore
+  alias Baileys.Store
   alias Baileys.Transport.WebSocket
 
   @default_max_retry_count 5
@@ -149,7 +149,7 @@ defmodule Baileys.ConnectionProcess do
            app_state_worker: nil,
            max_retry_requesters:
              Keyword.get(options, :max_retry_requesters, @default_max_retry_requesters),
-           session_path: Keyword.get(options, :session_path)
+           store: Keyword.fetch!(options, :store)
          }}
 
       {:error, reason} ->
@@ -252,7 +252,7 @@ defmodule Baileys.ConnectionProcess do
       {:ok, credentials, mutations} ->
         credentials = merge_app_state_credentials(state.credentials, credentials, base_pending)
 
-        with :ok <- persist_credentials(state.session_path, credentials) do
+        with :ok <- persist_credentials(state.store, credentials) do
           send(state.owner, {:connection_event, {:credentials, credentials}})
           send(state.owner, {:connection_event, {:app_state_mutations, mutations}})
 
@@ -286,7 +286,7 @@ defmodule Baileys.ConnectionProcess do
   def handle_call({:pairing_code, phone, custom_code}, _from, %{phase: :transport} = state) do
     with {:ok, code, node, credentials} <-
            Pairing.request_code(state.credentials, phone, custom_code),
-         :ok <- persist_credentials(state.session_path, credentials),
+         :ok <- persist_credentials(state.store, credentials),
          {:ok, state} <- send_node(node, %{state | credentials: credentials}) do
       send(state.owner, {:connection_event, {:credentials, credentials}})
       {:reply, {:ok, code}, state}
@@ -340,12 +340,12 @@ defmodule Baileys.ConnectionProcess do
 
   def handle_call({:commit_credentials, base, credentials}, _from, state) do
     with {:ok, credentials} <- merge_sender_credentials(state.credentials, base, credentials),
-         :ok <- persist_credentials(state.session_path, credentials) do
+         :ok <- persist_credentials(state.store, credentials) do
       send(state.owner, {:connection_event, {:credentials, credentials}})
       {:reply, {:ok, credentials}, %{state | credentials: credentials}}
     else
       {:error, :credentials_conflict} = error -> {:reply, error, state}
-      {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
 
@@ -380,13 +380,13 @@ defmodule Baileys.ConnectionProcess do
 
     credentials = %{credentials | pending_history_sync: pending_history_sync}
 
-    case persist_credentials(state.session_path, credentials) do
+    case persist_credentials(state.store, credentials) do
       :ok ->
         send(state.owner, {:connection_event, {:credentials, credentials}})
         {:reply, :ok, %{state | credentials: credentials}}
 
       {:error, reason} ->
-        {:reply, {:error, {:store, reason}}, state}
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -436,7 +436,7 @@ defmodule Baileys.ConnectionProcess do
     cond do
       NodeUtils.child(node, "pair-success") ->
         with {:ok, reply, credentials} <- Pairing.pair_success(node, state.credentials),
-             :ok <- persist_credentials(state.session_path, credentials),
+             :ok <- persist_credentials(state.store, credentials),
              {:ok, state} <- send_node(reply, %{state | credentials: credentials}) do
           send(state.owner, {:connection_event, {:credentials, credentials}})
           send(state.owner, {:connection_event, {:paired, credentials.me}})
@@ -482,7 +482,7 @@ defmodule Baileys.ConnectionProcess do
         if type == "result" do
           credentials = %{credentials | first_unuploaded_pre_key_id: last_id + 1}
 
-          with :ok <- persist_credentials(state.session_path, credentials) do
+          with :ok <- persist_credentials(state.store, credentials) do
             send(state.owner, {:connection_event, {:credentials, credentials}})
             go_online(%{state | credentials: credentials, pending_queries: pending})
           end
@@ -500,7 +500,7 @@ defmodule Baileys.ConnectionProcess do
               next_pre_key_id: max(state.credentials.next_pre_key_id, credentials.next_pre_key_id)
           }
 
-          with :ok <- persist_credentials(state.session_path, credentials) do
+          with :ok <- persist_credentials(state.store, credentials) do
             send(state.owner, {:connection_event, {:credentials, credentials}})
 
             send_node(Receiver.ack(notification, credentials), %{
@@ -544,7 +544,7 @@ defmodule Baileys.ConnectionProcess do
         if type == "result" do
           credentials = %{credentials | registered?: true}
 
-          with :ok <- persist_credentials(state.session_path, credentials) do
+          with :ok <- persist_credentials(state.store, credentials) do
             send(state.owner, {:connection_event, {:credentials, credentials}})
             {:ok, %{state | credentials: credentials, pending_queries: pending}}
           end
@@ -697,7 +697,7 @@ defmodule Baileys.ConnectionProcess do
 
       NodeUtils.child(node, "link_code_companion_reg") ->
         with {:ok, reply, credentials} <- Pairing.finish_code(node, state.credentials),
-             :ok <- persist_credentials(state.session_path, credentials),
+             :ok <- persist_credentials(state.store, credentials),
              {:ok, state} <-
                track_internal_query(reply, {:pairing_finish, credentials}, %{
                  state
@@ -828,7 +828,7 @@ defmodule Baileys.ConnectionProcess do
     if credentials == state.credentials do
       {:ok, state}
     else
-      with :ok <- persist_credentials(Map.get(state, :session_path), credentials) do
+      with :ok <- persist_credentials(state.store, credentials) do
         send(state.owner, {:connection_event, {:credentials, credentials}})
         {:ok, %{state | credentials: credentials}}
       end
@@ -915,7 +915,7 @@ defmodule Baileys.ConnectionProcess do
   defp start_prekey_replenishment(notification, attempt, state) do
     {credentials, upload, last_id} = PreKeys.upload_node(state.credentials, 5)
 
-    with :ok <- persist_credentials(state.session_path, credentials),
+    with :ok <- persist_credentials(state.store, credentials),
          {:ok, state} <-
            track_internal_query(
              upload,
@@ -1126,7 +1126,7 @@ defmodule Baileys.ConnectionProcess do
           %Node{content: routing_info} when is_binary(routing_info) ->
             credentials = %{state.credentials | routing_info: routing_info}
 
-            with :ok <- persist_credentials(state.session_path, credentials) do
+            with :ok <- persist_credentials(state.store, credentials) do
               send(state.owner, {:connection_event, {:credentials, credentials}})
               {:ok, %{state | credentials: credentials}}
             end
@@ -1154,7 +1154,7 @@ defmodule Baileys.ConnectionProcess do
     if count > 0 do
       {credentials, node, last_id} = PreKeys.upload_node(state.credentials, count)
 
-      with :ok <- persist_credentials(state.session_path, credentials),
+      with :ok <- persist_credentials(state.store, credentials),
            {:ok, state} <-
              track_internal_query(node, {:prekeys, credentials, last_id}, %{
                state
@@ -1449,7 +1449,7 @@ defmodule Baileys.ConnectionProcess do
       {:error, {:message_decrypt_failed, %{reason: reason, attempt: count, retry?: retry?}}}
     })
 
-    with :ok <- persist_credentials(Map.get(state, :session_path), credentials),
+    with :ok <- persist_credentials(state.store, credentials),
          {:ok, state} <- maybe_send_retry(retry, state),
          {:ok, state} <- send_node(Receiver.failure_ack(node, credentials), state) do
       send(state.owner, {:connection_event, {:credentials, credentials}})
@@ -1570,7 +1570,7 @@ defmodule Baileys.ConnectionProcess do
     do: <<value::unsigned-big-integer-size(bytes)-unit(8)>>
 
   defp acknowledge_message(credentials, protocol_response, state) do
-    with :ok <- persist_credentials(state.session_path, credentials),
+    with :ok <- persist_credentials(state.store, credentials),
          {:ok, state} <-
            send_node(protocol_response, %{
              state
@@ -1760,7 +1760,7 @@ defmodule Baileys.ConnectionProcess do
   defp send_retry_stanza(stanza, credentials, state, bundle_used?) do
     candidate_state = %{state | credentials: credentials}
 
-    case persist_credentials(candidate_state.session_path, credentials) do
+    case persist_credentials(candidate_state.store, credentials) do
       :ok ->
         send(candidate_state.owner, {:connection_event, {:credentials, credentials}})
 
@@ -1770,7 +1770,7 @@ defmodule Baileys.ConnectionProcess do
         end
 
       {:error, reason} ->
-        {:error, {:store, reason}, state, bundle_used?}
+        {:error, reason, state, bundle_used?}
     end
   end
 
@@ -1984,8 +1984,7 @@ defmodule Baileys.ConnectionProcess do
     end
   end
 
-  defp persist_credentials(nil, _credentials), do: :ok
-  defp persist_credentials(path, credentials), do: FileStore.save(path, credentials)
+  defp persist_credentials(store, credentials), do: Store.save(store, credentials)
 
   defp close_transport(transport) do
     if Process.alive?(transport) do

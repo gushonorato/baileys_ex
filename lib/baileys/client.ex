@@ -40,11 +40,16 @@ defmodule Baileys.Client do
   alias Baileys.HistorySync
   alias Baileys.Media.Download
   alias Baileys.Messages.Sender
-  alias Baileys.Store.File, as: FileStore
+  alias Baileys.Store
 
   def start_link(options) do
     options = Keyword.put_new(options, :owner, self())
     GenServer.start_link(__MODULE__, options, Keyword.take(options, [:name]))
+  end
+
+  def start(options) do
+    options = Keyword.put_new(options, :owner, self())
+    GenServer.start(__MODULE__, options, Keyword.take(options, [:name]))
   end
 
   def connect(client), do: GenServer.call(client, :connect, 30_000)
@@ -86,10 +91,10 @@ defmodule Baileys.Client do
   @impl true
   def init(options) do
     session = Keyword.get(options, :session, "default")
-    sessions_path = Keyword.get(options, :sessions_path)
 
     with :ok <- validate_session(session),
-         {:ok, credentials, session_path} <- FileStore.load_or_create(sessions_path, session) do
+         {:ok, store_config} <- fetch_store(options),
+         {:ok, credentials, store} <- Store.open(store_config, session) do
       owner = Keyword.fetch!(options, :owner)
 
       {:ok,
@@ -100,7 +105,7 @@ defmodule Baileys.Client do
          connection: nil,
          connection_monitor: nil,
          credentials: credentials,
-         session_path: session_path,
+         store: store,
          options: options,
          history_queue: pending_history_queue(credentials),
          history_worker: nil,
@@ -182,19 +187,13 @@ defmodule Baileys.Client do
           |> cancel_history_pause()
           |> stop_history_worker()
 
-        with :ok <- FileStore.reset(state.session_path),
-             {:ok, credentials, session_path} <-
-               FileStore.load_or_create(
-                 Path.dirname(state.session_path),
-                 Path.basename(state.session_path, ".json")
-               ) do
+        with {:ok, credentials} <- Store.reset(state.store) do
           {:reply, :ok,
            %{
              state
              | connection: nil,
                connection_monitor: nil,
                credentials: credentials,
-               session_path: session_path,
                status: :disconnected,
                history_queue: :queue.new(),
                history_worker: nil,
@@ -203,7 +202,7 @@ defmodule Baileys.Client do
                history_retries: %{}
            }}
         else
-          {:error, reason} -> {:reply, {:error, {:store, reason}}, state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
         end
 
       {:error, reason} ->
@@ -527,7 +526,7 @@ defmodule Baileys.Client do
   end
 
   defp start_connection_state(state) do
-    connection_options = Keyword.put(state.options, :session_path, state.session_path)
+    connection_options = Keyword.put(state.options, :store, state.store)
 
     case ConnectionProcess.start_link(self(), state.credentials, connection_options) do
       {:ok, connection} ->
@@ -547,6 +546,19 @@ defmodule Baileys.Client do
   end
 
   defp validate_session(_session), do: {:error, :invalid_session}
+
+  defp fetch_store(options) do
+    cond do
+      Keyword.has_key?(options, :sessions_path) ->
+        {:error, {:unsupported_option, :sessions_path}}
+
+      Keyword.has_key?(options, :store) ->
+        {:ok, Keyword.fetch!(options, :store)}
+
+      true ->
+        {:error, :store_required}
+    end
+  end
 
   defp message_timestamp(%DateTime{} = timestamp), do: timestamp
   defp message_timestamp(timestamp), do: DateTime.from_unix!(timestamp)

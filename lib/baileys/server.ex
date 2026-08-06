@@ -3,19 +3,29 @@ defmodule Baileys.Server do
 
   use GenServer
 
-  alias Baileys.Event
   alias Baileys.Client
+  alias Baileys.Event
+  alias Baileys.Store
 
   @gen_server_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
-  @client_options [:session, :sessions_path, :request_timeout]
+  @client_options [:session, :store, :request_timeout]
 
   def start_link(module, init_arg, options) do
-    with :ok <- validate_sessions_path(options) do
-      GenServer.start_link(
-        __MODULE__,
-        {module, init_arg, options},
-        Keyword.take(options, @gen_server_options)
-      )
+    with :ok <- validate_store(options) do
+      # Initialize without a link so adapter startup failures are returned to
+      # the caller, then establish the usual start_link relationship.
+      case GenServer.start(
+             __MODULE__,
+             {module, init_arg, options},
+             Keyword.take(options, @gen_server_options)
+           ) do
+        {:ok, server} = started ->
+          Process.link(server)
+          started
+
+        other ->
+          other
+      end
     end
   end
 
@@ -23,12 +33,11 @@ defmodule Baileys.Server do
   def init({module, init_arg, options}) do
     with {:ok, callback_state} <- normalize_init(module.init(init_arg)),
          {:ok, client} <-
-           Client.start_link(
+           Client.start(
              options
              |> Keyword.take(@client_options)
              |> Keyword.put(:owner, self())
            ) do
-      Process.unlink(client)
       monitor = Process.monitor(client)
 
       state = %{
@@ -110,18 +119,19 @@ defmodule Baileys.Server do
   defp normalize_init(:ignore), do: :ignore
   defp normalize_init(other), do: {:error, {:bad_init_return, other}}
 
-  defp validate_sessions_path(options) do
-    case Keyword.fetch(options, :sessions_path) do
-      {:ok, path} when is_binary(path) ->
-        if Path.type(path) == :absolute,
-          do: :ok,
-          else: {:error, :sessions_path_must_be_absolute}
+  defp validate_store(options) do
+    cond do
+      Keyword.has_key?(options, :sessions_path) ->
+        {:error, {:unsupported_option, :sessions_path}}
 
-      {:ok, _path} ->
-        {:error, :invalid_sessions_path}
+      not Keyword.has_key?(options, :store) ->
+        {:error, :store_required}
 
-      :error ->
-        {:error, :sessions_path_required}
+      not Store.valid_config?(Keyword.fetch!(options, :store)) ->
+        {:error, :invalid_store}
+
+      true ->
+        :ok
     end
   end
 end

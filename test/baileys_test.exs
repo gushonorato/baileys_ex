@@ -15,20 +15,20 @@ defmodule BaileysTest do
   use ExUnit.Case, async: true
 
   test "starts like a GenServer and delivers typed callback events" do
-    sessions_path =
+    root =
       Path.join(System.tmp_dir!(), "baileys-behaviour-#{System.unique_integer([:positive])}")
 
-    on_exit(fn -> File.rm_rf!(sessions_path) end)
+    on_exit(fn -> File.rm_rf!(root) end)
 
     assert {:ok, server} =
              Baileys.start_link(BaileysTest.Handler, self(),
                connect: false,
                session: "callback",
-               sessions_path: sessions_path
+               store: {Baileys.Store.File, root: root}
              )
 
     assert Baileys.status(server) == :disconnected
-    assert File.exists?(Path.join(sessions_path, "callback.json"))
+    assert File.exists?(Path.join(root, "callback.json"))
     client = :sys.get_state(server).client
     qr = %Baileys.QR{payload: "payload"}
     send(server, {:baileys, client, {:qr, qr}})
@@ -42,14 +42,54 @@ defmodule BaileysTest do
              {:ok, "5521986399132@s.whatsapp.net"}
   end
 
-  test "requires an absolute sessions path" do
-    assert {:error, :sessions_path_required} =
-             Baileys.start_link(BaileysTest.Handler, self(), connect: false)
+  test "uses the default session and preserves session validation" do
+    root = Path.join(System.tmp_dir!(), "baileys-default-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
 
-    assert {:error, :sessions_path_must_be_absolute} =
+    assert {:ok, server} =
              Baileys.start_link(BaileysTest.Handler, self(),
                connect: false,
-               sessions_path: "relative/sessions"
+               store: {Baileys.Store.File, root: root}
+             )
+
+    assert File.exists?(Path.join(root, "default.json"))
+    GenServer.stop(server)
+
+    assert {:error, :invalid_session} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               session: "../unsafe",
+               store: {Baileys.Store.Memory, []}
+             )
+  end
+
+  test "requires an explicit valid store and rejects sessions_path" do
+    assert {:error, :store_required} =
+             Baileys.start_link(BaileysTest.Handler, self(), connect: false)
+
+    assert {:error, :invalid_store} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: Baileys.Store.Memory
+             )
+
+    assert {:error, :invalid_store} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: {String, []}
+             )
+
+    assert {:error, {:unsupported_option, :sessions_path}} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: {Baileys.Store.Memory, []},
+               sessions_path: "/tmp/unsupported"
+             )
+
+    assert {:error, {:store, :root_must_be_absolute}} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: {Baileys.Store.File, root: "relative/sessions"}
              )
   end
 end

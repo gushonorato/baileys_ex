@@ -12,7 +12,7 @@ defmodule WhatsAppCLI.Handler do
 end
 
 defmodule WhatsAppCLI do
-  @sessions_path Path.expand("baileys_sessions", __DIR__)
+  @sessions_root Path.expand("baileys_sessions", __DIR__)
 
   def run do
     Process.flag(:trap_exit, true)
@@ -26,7 +26,7 @@ defmodule WhatsAppCLI do
 
     case Baileys.start_link(WhatsAppCLI.Handler, self(),
            session: "whatsapp_cli",
-           sessions_path: @sessions_path
+           store: {Baileys.Store.File, root: @sessions_root}
          ) do
       {:ok, server} ->
         loop(%{server: server, reader: nil, active_chat: nil, online?: false})

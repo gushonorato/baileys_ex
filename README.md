@@ -29,7 +29,7 @@ defmodule MyWhatsApp do
     Baileys.start_link(__MODULE__, phone,
       name: __MODULE__,
       session: "primary",
-      sessions_path: Path.expand("baileys_sessions")
+      store: {Baileys.Store.File, root: Path.expand("baileys_sessions")}
     )
   end
 
@@ -69,17 +69,58 @@ end
 `client` field can be used for synchronous commands inside the callback without
 calling the callback process itself.
 
-`sessions_path` is required and must be absolute. Credentials, prekeys, direct
-Signal sessions and group sender-key records are persisted as
-`<sessions_path>/<session>.json` using a versioned schema and Base64 for binary
-fields. Schema v2 adds sender-key storage, schema v3 adds non-secret account
-settings/privacy tokens, and schema v4 adds resumable history/app-state data.
-Schema v1-v3 JSON and files from the previous
-`<sessions_path>/<session>/session.json` layout and legacy
-`session.etf` files are safely migrated on first load. The directory and file
-modes are `0700` and `0600`. Do not run two clients against the same session.
-Base64 is an encoding, not encryption; the JSON file contains secrets and must
+`store` is required; there is no implicit in-memory fallback. The old
+`sessions_path` option is unsupported. Credentials, prekeys, direct Signal
+sessions and group sender-key records use a versioned JSON schema with Base64
+for binary fields. Schema v2 adds sender-key storage, schema v3 adds non-secret
+account settings/privacy tokens, and schema v4 adds resumable
+history/app-state data. Do not run two clients against the same session.
+Base64 is an encoding, not encryption; stored payloads contain secrets and must
 not be shared or committed.
+
+### Storage adapters
+
+The filesystem adapter requires an absolute root and stores each session as
+`<root>/<session>.json`:
+
+```elixir
+store: {Baileys.Store.File, root: "/var/lib/baileys"}
+```
+
+Schema v1-v3 JSON and files from the previous
+`<root>/<session>/session.json` layout and legacy `session.etf` files are safely
+migrated on first load. Directory and file modes are `0700` and `0600`, and
+writes use a temporary file followed by an atomic rename.
+
+The memory adapter must also be selected explicitly. Every client receives an
+isolated store linked to its process, so all sessions in that instance disappear
+when the client terminates:
+
+```elixir
+store: {Baileys.Store.Memory, []}
+```
+
+For S3, credentials come from the standard ExAws/AWS provider chain. Do not put
+access keys in Baileys options:
+
+```elixir
+store: {
+  Baileys.Store.S3,
+  bucket: "my-baileys-sessions",
+  region: "sa-east-1",
+  prefix: "production/baileys"
+}
+```
+
+`prefix` defaults to `"baileys"`, producing keys such as
+`baileys/primary.json`. For S3-compatible services, pass ExAws overrides such as
+`ex_aws_options: [scheme: "http://", host: "localhost", port: 9000]`. Requests
+always use the official `ExAws.Request.Req` HTTP adapter.
+
+The minimum IAM object permissions are `s3:GetObject`, `s3:PutObject` and
+`s3:DeleteObject` for `<prefix>/*`. Grant `s3:ListBucket` on the bucket with an
+`s3:prefix` condition restricted to that prefix. HTTP 404/`NoSuchKey` means a
+new session; HTTP 403 remains an authorization error.
 
 ## QR Pairing
 

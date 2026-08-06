@@ -4,21 +4,41 @@ defmodule Baileys.Store.FileTest do
   alias Baileys.Auth.Credentials
   alias Baileys.Proto.{ADVSignedDeviceIdentity, Message}
   alias Baileys.Signal.SenderKey
+  alias Baileys.Store
   alias Baileys.Store.File, as: FileStore
+  alias Baileys.Store.JSONCodec
 
   test "round trips credentials through versioned JSON" do
     root = temporary_root()
-    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
     path = Path.join(root, "safe.json")
-    assert :ok = FileStore.save(path, credentials)
+    assert {:ok, _created, store} = open(root, "safe")
+    assert :ok = Store.save(store, credentials)
 
     assert {:ok, %{"version" => 4}} =
              path |> File.read!() |> Jason.decode()
 
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "safe")
+    assert {:ok, ^credentials, _store} = open(root, "safe")
+  end
+
+  test "adapter writes atomically with private permissions and deletes idempotently" do
+    root = temporary_root()
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, state} = FileStore.init(root: root)
+    assert :ok = FileStore.put(state, "atomic", "first")
+    assert :ok = FileStore.put(state, "atomic", "second")
+    assert {:ok, "second"} = FileStore.fetch(state, "atomic")
+
+    assert Bitwise.band(File.stat!(root).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(Path.join(root, "atomic.json")).mode, 0o777) == 0o600
+    assert Path.wildcard(Path.join(root, "atomic.json.tmp-*")) == []
+
+    assert :ok = FileStore.delete(state, "atomic")
+    assert :ok = FileStore.delete(state, "atomic")
+    assert :not_found = FileStore.fetch(state, "atomic")
   end
 
   test "migrates JSON from the session directory and removes the empty directory" do
@@ -30,9 +50,10 @@ defmodule Baileys.Store.FileTest do
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
-    assert :ok = FileStore.save(legacy_path, credentials)
+    {:ok, payload} = JSONCodec.encode(credentials)
+    File.write!(legacy_path, payload)
 
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy-json")
+    assert {:ok, ^credentials, _store} = open(root, "legacy-json")
     assert File.exists?(path)
     refute File.exists?(legacy_directory)
   end
@@ -51,9 +72,10 @@ defmodule Baileys.Store.FileTest do
       :erlang.term_to_binary(credentials)
     )
 
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy")
+    assert {:ok, ^credentials, _store} = open(root, "legacy")
     assert File.exists?(path)
     refute File.exists?(legacy_directory)
+    refute match?(<<131, _::binary>>, File.read!(path))
   end
 
   test "migrates legacy ETF credentials created before sender-key storage" do
@@ -76,21 +98,20 @@ defmodule Baileys.Store.FileTest do
       :erlang.term_to_binary(legacy_credentials)
     )
 
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "legacy-old-struct")
+    assert {:ok, ^credentials, _store} = open(root, "legacy-old-struct")
     assert File.exists?(path)
     refute File.exists?(legacy_directory)
   end
 
   test "round trips prekeys, protobuf account and Signal sessions" do
     root = temporary_root()
-    path = Path.join(root, "paired.json")
-    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = paired_credentials()
 
-    assert :ok = FileStore.save(path, credentials)
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "paired")
+    assert {:ok, _created, store} = open(root, "paired")
+    assert :ok = Store.save(store, credentials)
+    assert {:ok, ^credentials, _store} = open(root, "paired")
   end
 
   test "rejects an unsupported JSON schema version" do
@@ -101,71 +122,41 @@ defmodule Baileys.Store.FileTest do
 
     File.write!(path, Jason.encode!(%{"version" => 5, "credentials" => %{}}))
 
-    assert {:error, :unsupported_session_version} = FileStore.load_or_create(root, "future")
+    assert {:error, {:store, :unsupported_session_version}} = open(root, "future")
   end
 
-  test "migrates version one JSON with empty sender-key storage" do
+  test "migrates all previous JSON schema versions" do
     root = temporary_root()
-    path = Path.join(root, "version-one.json")
-    File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
-    assert :ok = FileStore.save(path, credentials)
-    document = path |> File.read!() |> Jason.decode!()
 
-    document =
-      document
-      |> Map.put("version", 1)
-      |> update_in(["credentials"], &Map.delete(&1, "sender_keys"))
+    for {version, removed} <- [
+          {1, ["sender_keys", "account_settings", "privacy_tokens", "pending_app_state_sync"]},
+          {2, ["account_settings", "privacy_tokens", "pending_app_state_sync"]},
+          {3,
+           [
+             "history_sync_progress",
+             "pending_history_sync",
+             "app_state_sync_keys",
+             "app_state_collections",
+             "my_app_state_key_id"
+           ]}
+        ] do
+      session = "version-#{version}"
+      path = Path.join(root, "#{session}.json")
+      {:ok, payload} = JSONCodec.encode(credentials)
 
-    File.write!(path, Jason.encode!(document))
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-one")
-  end
+      document =
+        payload
+        |> Jason.decode!()
+        |> Map.put("version", version)
+        |> update_in(["credentials"], &Map.drop(&1, removed))
 
-  test "migrates version two JSON with empty account settings" do
-    root = temporary_root()
-    path = Path.join(root, "version-two.json")
-    File.mkdir_p!(root)
-    on_exit(fn -> File.rm_rf!(root) end)
-
-    credentials = Credentials.new()
-    assert :ok = FileStore.save(path, credentials)
-    document = path |> File.read!() |> Jason.decode!()
-
-    document =
-      document
-      |> Map.put("version", 2)
-      |> update_in(["credentials"], &Map.delete(&1, "account_settings"))
-
-    File.write!(path, Jason.encode!(document))
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-two")
-  end
-
-  test "migrates version three JSON with empty history and app-state storage" do
-    root = temporary_root()
-    path = Path.join(root, "version-three.json")
-    File.mkdir_p!(root)
-    on_exit(fn -> File.rm_rf!(root) end)
-
-    credentials = Credentials.new()
-    assert :ok = FileStore.save(path, credentials)
-    document = path |> File.read!() |> Jason.decode!()
-
-    document =
-      document
-      |> Map.put("version", 3)
-      |> update_in(["credentials"], fn stored ->
-        Map.drop(stored, [
-          "history_sync_progress",
-          "app_state_sync_keys",
-          "app_state_collections",
-          "my_app_state_key_id"
-        ])
-      end)
-
-    File.write!(path, Jason.encode!(document))
-    assert {:ok, ^credentials, ^path} = FileStore.load_or_create(root, "version-three")
+      File.mkdir_p!(root)
+      File.write!(path, Jason.encode!(document))
+      assert {:ok, ^credentials, _store} = open(root, session)
+    end
   end
 
   test "rejects malformed Base64 in JSON credentials" do
@@ -175,13 +166,14 @@ defmodule Baileys.Store.FileTest do
     on_exit(fn -> File.rm_rf!(root) end)
 
     credentials = Credentials.new()
-    assert :ok = FileStore.save(path, credentials)
+    {:ok, payload} = JSONCodec.encode(credentials)
+    File.write!(path, payload)
 
     document = path |> File.read!() |> Jason.decode!()
     document = put_in(document, ["credentials", "adv_secret_key"], "not base64!")
     File.write!(path, Jason.encode!(document))
 
-    assert {:error, :invalid_credentials} = FileStore.load_or_create(root, "malformed")
+    assert {:error, {:store, :invalid_credentials}} = open(root, "malformed")
   end
 
   test "rejects legacy ETF containing an atom outside the persisted schema" do
@@ -194,19 +186,20 @@ defmodule Baileys.Store.FileTest do
     encoded = <<131, 100, byte_size(atom_name)::16, atom_name::binary>>
     File.write!(Path.join(legacy_directory, "session.etf"), encoded)
 
-    assert {:error, :invalid_credentials} = FileStore.load_or_create(root, "unsafe")
+    assert {:error, {:store, :invalid_credentials}} = open(root, "unsafe")
   end
 
-  test "requires an absolute sessions path" do
-    assert {:error, :sessions_path_required} = FileStore.load_or_create(nil, "missing")
-
-    assert {:error, :sessions_path_must_be_absolute} =
-             FileStore.load_or_create("relative/sessions", "relative")
+  test "requires an absolute root" do
+    assert {:error, :root_required} = FileStore.init([])
+    assert {:error, :root_must_be_absolute} = FileStore.init(root: "relative/sessions")
+    assert {:error, :invalid_root} = FileStore.init(root: nil)
   end
 
   defp temporary_root do
     Path.join(System.tmp_dir!(), "baileys-store-#{System.unique_integer([:positive])}")
   end
+
+  defp open(root, session), do: Store.open({FileStore, root: root}, session)
 
   defp paired_credentials do
     credentials = Credentials.new()

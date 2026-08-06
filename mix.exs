@@ -24,11 +24,14 @@ defmodule Baileys.MixProject do
   defp deps do
     [
       {:castore, "~> 1.0"},
+      {:ex_aws, "~> 2.7"},
+      {:ex_aws_s3, "~> 2.5"},
       {:jason, "~> 1.4"},
       {:mint, "~> 1.7"},
       {:mint_web_socket, "~> 1.0"},
       {:protobuf, "~> 0.17"},
-      {:qr_code, "~> 3.2"}
+      {:qr_code, "~> 3.2"},
+      {:req, "~> 0.6.0"}
     ]
   end
 

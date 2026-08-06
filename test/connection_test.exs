@@ -9,14 +9,21 @@ defmodule Baileys.ConnectionProcessTest do
   alias Baileys.Messages.Sender
   alias Baileys.Proto.{ADVSignedDeviceIdentity, Message}
   alias Baileys.Signal.{SenderKey, SessionBuilder, SessionCipher}
+  alias Baileys.Store
+  alias Baileys.Store.Memory
   alias Baileys.{Crypto, Protocol.Pairing}
 
   setup do
     test_pid = self()
+    {:ok, _credentials, store} = Store.open({Memory, []}, "connection-test")
 
     state = %{
       owner: test_pid,
-      credentials: %Credentials{me: %{id: "5511000000000:2@s.whatsapp.net"}},
+      store: store,
+      credentials: %{
+        Credentials.new()
+        | me: %{id: "5511000000000:2@s.whatsapp.net", name: "Fixture"}
+      },
       now: fn -> ~U[2000-01-01 00:00:00Z] end,
       diagnostic_sender: fn diagnostic -> send(test_pid, {:diagnostic, diagnostic}) end,
       node_sender: fn node ->
@@ -290,7 +297,6 @@ defmodule Baileys.ConnectionProcessTest do
       content: [%Node{tag: "set", attrs: %{"id" => "hash"}}]
     }
 
-    state = Map.put(state, :session_path, nil)
     assert {:ok, ^state} = ConnectionProcess.dispatch(picture, state)
 
     assert_receive {:connection_event,
@@ -304,11 +310,11 @@ defmodule Baileys.ConnectionProcessTest do
     credentials = %{
       state.credentials
       | sessions: %{
-          "contact:1@s.whatsapp.net" => %{record: 1},
-          "contact:2@s.whatsapp.net" => %{record: 2},
-          "9000:2@lid" => %{record: 4},
-          "9000:3@lid" => %{record: 5},
-          "other:1@s.whatsapp.net" => %{record: 3}
+          "contact:1@s.whatsapp.net" => %{sessions: %{}},
+          "contact:2@s.whatsapp.net" => %{sessions: %{}},
+          "9000:2@lid" => %{sessions: %{}},
+          "9000:3@lid" => %{sessions: %{}},
+          "other:1@s.whatsapp.net" => %{sessions: %{}}
         },
         lid_mappings: %{"contact@s.whatsapp.net" => "9000@lid"}
     }
@@ -324,7 +330,7 @@ defmodule Baileys.ConnectionProcessTest do
       ]
     }
 
-    state = state |> Map.put(:credentials, credentials) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, credentials)
     assert {:ok, state} = ConnectionProcess.dispatch(remove, state)
     refute Map.has_key?(state.credentials.sessions, "contact:2@s.whatsapp.net")
     refute Map.has_key?(state.credentials.sessions, "9000:2@lid")
@@ -357,7 +363,6 @@ defmodule Baileys.ConnectionProcessTest do
       state
       |> Map.put(:credentials, deterministic_credentials(50))
       |> Map.put(:pending_queries, %{})
-      |> Map.put(:session_path, nil)
 
     assert {:ok, state} = ConnectionProcess.dispatch(notification, state)
     assert map_size(state.pending_queries) == 1
@@ -385,7 +390,6 @@ defmodule Baileys.ConnectionProcessTest do
       state
       |> Map.put(:credentials, deterministic_credentials(51))
       |> Map.put(:pending_queries, %{})
-      |> Map.put(:session_path, nil)
 
     assert {:ok, state} = ConnectionProcess.dispatch(notification, state)
     assert_receive {:sent_node, %Node{tag: "iq"}}
@@ -415,12 +419,12 @@ defmodule Baileys.ConnectionProcessTest do
   test "merges sender credential deltas without overwriting concurrent state", %{state: state} do
     base = %{
       deterministic_credentials(60)
-      | sessions: %{"contact:1@s.whatsapp.net" => %{ratchet: :base}}
+      | sessions: %{}
     }
 
     updated = %{
       base
-      | sessions: %{"contact:1@s.whatsapp.net" => %{ratchet: :sender}},
+      | sessions: %{"contact:1@s.whatsapp.net" => %{sessions: %{}}},
         lid_mappings: %{"contact@s.whatsapp.net" => "9000@lid"}
     }
 
@@ -434,7 +438,7 @@ defmodule Baileys.ConnectionProcessTest do
         }
     }
 
-    state = state |> Map.put(:credentials, current) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, current)
 
     assert {:reply, {:ok, merged}, state} =
              ConnectionProcess.handle_call(
@@ -443,12 +447,12 @@ defmodule Baileys.ConnectionProcessTest do
                state
              )
 
-    assert merged.sessions["contact:1@s.whatsapp.net"] == %{ratchet: :sender}
+    assert merged.sessions["contact:1@s.whatsapp.net"] == %{sessions: %{}}
     assert merged.account_settings == current.account_settings
     assert merged.lid_mappings == updated.lid_mappings
     assert_receive {:connection_event, {:credentials, ^merged}}
 
-    conflicted = put_in(current.sessions["contact:1@s.whatsapp.net"], %{ratchet: :receiver})
+    conflicted = put_in(current.lid_mappings["contact@s.whatsapp.net"], "different@lid")
     state = %{state | credentials: conflicted}
 
     assert {:reply, {:error, :credentials_conflict}, ^state} =
@@ -460,8 +464,6 @@ defmodule Baileys.ConnectionProcessTest do
   end
 
   test "persists validated server-sync collections for app-state processing", %{state: state} do
-    state = Map.put(state, :session_path, nil)
-
     state =
       Enum.reduce(
         ["critical_block", "critical_unblock_low", "regular_high", "regular_low", "regular"],
@@ -534,7 +536,6 @@ defmodule Baileys.ConnectionProcessTest do
       state
       |> Map.put(:credentials, credentials)
       |> Map.put(:pending_queries, %{})
-      |> Map.put(:session_path, nil)
 
     assert {:ok, updated_state} = ConnectionProcess.dispatch(notification, state)
     assert map_size(updated_state.pending_queries) == 1
@@ -902,7 +903,6 @@ defmodule Baileys.ConnectionProcessTest do
           deterministic_credentials(30)
           | me: %{id: "5511000000000:2@s.whatsapp.net", lid: "123456789:2@lid"}
         },
-        session_path: nil,
         sent_messages: %{
           "message-1" => Sender.retry_material("5521999999999@s.whatsapp.net", "retry me")
         },
@@ -1060,7 +1060,9 @@ defmodule Baileys.ConnectionProcessTest do
   } do
     {state, _remote, receipt} = retry_state(state, 2)
     missing_parent = Path.join(System.tmp_dir!(), "missing-#{System.unique_integer([:positive])}")
-    state = %{state | session_path: Path.join(missing_parent, "session.json")}
+    {:ok, _credentials, store} = Store.open({Baileys.Store.File, root: missing_parent}, "session")
+    File.rm_rf!(missing_parent)
+    state = %{state | store: store}
 
     assert {:ok, state} = ConnectionProcess.dispatch(receipt, state)
     assert state.retry_counts[{"message-1", receipt.attrs["participant"]}] == 1
@@ -1075,7 +1077,7 @@ defmodule Baileys.ConnectionProcessTest do
 
     state = %{
       credentials: old_credentials,
-      session_path: "/missing/session.json",
+      store: :unused,
       subscribers: %{}
     }
 
@@ -1095,7 +1097,7 @@ defmodule Baileys.ConnectionProcessTest do
 
     {local, message, raw} = encrypted_incoming_message(content)
 
-    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, local)
     assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
 
     assert_receive {:sent_node,
@@ -1139,7 +1141,7 @@ defmodule Baileys.ConnectionProcessTest do
         "offline" => "1"
       })
 
-    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, local)
     assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
     assert_receive {:sent_node, %Node{tag: "receipt"}}
     assert_receive {:connection_event, {:messages_upsert, [envelope], :append, nil}}
@@ -1151,7 +1153,7 @@ defmodule Baileys.ConnectionProcessTest do
   test "client projects complete envelopes into a public upsert batch", %{state: state} do
     content = %Message{conversation: "public upsert"}
     {local, message, _raw} = encrypted_incoming_message(content)
-    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, local)
     assert {:ok, _state} = ConnectionProcess.dispatch(message, state)
     assert_receive {:connection_event, {:messages_upsert, [envelope], :notify, nil}}
 
@@ -1201,7 +1203,6 @@ defmodule Baileys.ConnectionProcessTest do
     state =
       state
       |> Map.put(:credentials, credentials)
-      |> Map.put(:session_path, nil)
       |> Map.put(:max_retry_count, 0)
 
     assert {:ok, state} = ConnectionProcess.dispatch(message, state)
@@ -1241,7 +1242,6 @@ defmodule Baileys.ConnectionProcessTest do
       state =
         state
         |> Map.put(:credentials, credentials)
-        |> Map.put(:session_path, nil)
         |> Map.put(:max_retry_count, 0)
 
       assert {:ok, updated} = ConnectionProcess.dispatch(message, state)
@@ -1260,7 +1260,7 @@ defmodule Baileys.ConnectionProcessTest do
     }
 
     {local, distribution_node, _raw} = encrypted_incoming_message(distribution_content)
-    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, local)
     assert {:ok, state} = ConnectionProcess.dispatch(distribution_node, state)
 
     sender_key_name =
@@ -1323,7 +1323,7 @@ defmodule Baileys.ConnectionProcessTest do
       ]
     }
 
-    state = state |> Map.put(:credentials, local) |> Map.put(:session_path, nil)
+    state = Map.put(state, :credentials, local)
     assert {:ok, state} = ConnectionProcess.dispatch(group_node, state)
 
     sender_key_name =
@@ -1370,7 +1370,6 @@ defmodule Baileys.ConnectionProcessTest do
     state =
       state
       |> Map.put(:credentials, local)
-      |> Map.put(:session_path, nil)
       |> Map.put(:max_retry_count, 5)
 
     assert {:ok, state} = ConnectionProcess.dispatch(group_node, state)
@@ -1534,7 +1533,6 @@ defmodule Baileys.ConnectionProcessTest do
     state =
       state
       |> Map.put(:credentials, local)
-      |> Map.put(:session_path, nil)
       |> Map.put(:sent_messages, %{
         "message-1" => Sender.retry_material("5521999999999@s.whatsapp.net", "retry me")
       })

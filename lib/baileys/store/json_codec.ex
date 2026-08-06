@@ -6,6 +6,98 @@ defmodule Baileys.Store.JSONCodec do
   alias Baileys.Signal.SenderKey
 
   @version 4
+  @persisted_atoms [
+    Baileys.Auth.Credentials,
+    Baileys.Proto.ADVSignedDeviceIdentity,
+    Baileys.Proto.Message.AppStateSyncKeyData,
+    Baileys.Proto.Message.AppStateSyncKeyFingerprint,
+    :__protobuf__,
+    :__struct__,
+    :__unknown_fields__,
+    :account,
+    :account_settings,
+    :app_state_collections,
+    :app_state_sync_keys,
+    :accountSignature,
+    :accountSignatureKey,
+    :adv_secret_key,
+    :base_key,
+    :base_key_type,
+    :chain_key,
+    :chain_type,
+    :chunk_order,
+    :chains,
+    :closed,
+    :counter,
+    :created,
+    :current_ratchet,
+    :details,
+    :deviceSignature,
+    :ephemeral_key_pair,
+    :ephemeral_expiration,
+    :ephemeral_setting_timestamp,
+    :default_disappearing_mode,
+    :first_unuploaded_pre_key_id,
+    :id,
+    :history_sync_progress,
+    :hash,
+    :index_info,
+    :index_value_map,
+    :key,
+    :keyData,
+    :key_id,
+    :key_pair,
+    :last_remote_ephemeral_key,
+    :lid,
+    :lid_mappings,
+    :fingerprint,
+    :rawId,
+    :currentIndex,
+    :deviceIndexes,
+    :me,
+    :message_keys,
+    :my_app_state_key_id,
+    :name,
+    :next_pre_key_id,
+    :noise_key,
+    :pairing_code,
+    :pairing_ephemeral_key,
+    :pending_pre_key,
+    :peer_data_request_session_id,
+    :pending_app_state_sync,
+    :pending_history_sync,
+    :platform,
+    :pre_key_id,
+    :pre_keys,
+    :progress,
+    :privacy_tokens,
+    :previous_counter,
+    :private,
+    :public,
+    :registered?,
+    :registration_id,
+    :remote_identity_key,
+    :root_key,
+    :request_id,
+    :routing_info,
+    :sessions,
+    :sender_keys,
+    :states,
+    :sender_key_id,
+    :signing_key,
+    :seed,
+    :iteration,
+    :signature,
+    :signed_identity_key,
+    :signed_key_id,
+    :signed_pre_key,
+    :sync_type,
+    :timestamp,
+    :token,
+    :used,
+    :version,
+    :original_message_id
+  ]
 
   def encode(%Credentials{} = credentials) do
     Jason.encode(%{
@@ -28,6 +120,27 @@ defmodule Baileys.Store.JSONCodec do
     end
   rescue
     _error -> {:error, :invalid_credentials}
+  end
+
+  def decode_legacy(encoded) when is_binary(encoded) do
+    preload_schema_atoms()
+
+    try do
+      case :erlang.binary_to_term(encoded, [:safe]) do
+        %Credentials{} = credentials ->
+          credentials = credentials |> Map.from_struct() |> then(&struct(Credentials, &1))
+          {:ok, credentials}
+
+        _other ->
+          {:error, :invalid_credentials}
+      end
+    rescue
+      ArgumentError -> {:error, :invalid_credentials}
+    end
+  end
+
+  defp preload_schema_atoms do
+    Enum.each(@persisted_atoms, &:erlang.atom_to_binary/1)
   end
 
   defp validate_version(%{"version" => version}) when version in [1, 2, 3, @version],
@@ -434,7 +547,7 @@ defmodule Baileys.Store.JSONCodec do
   defp encode_me(nil), do: nil
 
   defp encode_me(me) do
-    %{"id" => me.id, "name" => me.name}
+    %{"id" => Map.fetch!(me, :id), "name" => Map.get(me, :name, "")}
     |> maybe_put("lid", me, :lid)
   end
 
