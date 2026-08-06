@@ -42,6 +42,38 @@ defmodule BaileysTest do
              {:ok, "5521986399132@s.whatsapp.net"}
   end
 
+  test "delivers the original disconnect reason and code in the callback event" do
+    assert {:ok, server} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               session: "disconnect-callback",
+               store: {Baileys.Store.Memory, []}
+             )
+
+    client = :sys.get_state(server).client
+    connection = spawn(fn -> Process.sleep(:infinity) end)
+
+    :sys.replace_state(client, fn state ->
+      %{
+        state
+        | connection: connection,
+          connection_monitor: Process.monitor(connection),
+          status: :online
+      }
+    end)
+
+    Process.exit(connection, {:shutdown, {:disconnected, :logged_out, 401}})
+
+    assert_receive {:callback_event,
+                    %Baileys.Event{
+                      client: ^client,
+                      type: :disconnected,
+                      data: %Baileys.Disconnected{reason: :logged_out, code: 401}
+                    }, :disconnected}
+
+    refute_receive {:callback_event, %Baileys.Event{type: :error}, _status}
+  end
+
   test "uses the default session and preserves session validation" do
     root = Path.join(System.tmp_dir!(), "baileys-default-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(root) end)
