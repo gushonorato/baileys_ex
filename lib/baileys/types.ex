@@ -375,7 +375,12 @@ defmodule Baileys.MessageStatus do
 end
 
 defmodule Baileys.Disconnected do
-  @moduledoc "Stable reason for a closed connection."
+  @moduledoc """
+  Stable reason and status code for a closed connection.
+
+  The library reports the transport or server reason without deciding whether
+  the caller should retry, alert, or start a new pairing.
+  """
 
   @type reason ::
           :connection_closed

@@ -28,6 +28,52 @@ defmodule Baileys.ConnectionProcessTest do
     %{state: state}
   end
 
+  test "preserves detailed stream disconnect reasons and codes", %{state: state} do
+    for {code, reason} <- [
+          {401, :logged_out},
+          {403, :forbidden},
+          {408, :connection_lost},
+          {411, :multidevice_mismatch},
+          {428, :connection_closed},
+          {440, :connection_replaced},
+          {500, :bad_session},
+          {503, :service_unavailable},
+          {515, :restart_required},
+          {516, :unknown}
+        ] do
+      node = %Node{tag: "stream:error", attrs: %{"code" => Integer.to_string(code)}}
+      assert {:error, {:disconnected, ^reason, ^code}} = ConnectionProcess.dispatch(node, state)
+    end
+
+    timed_out = %Node{
+      tag: "stream:error",
+      attrs: %{"code" => "408"},
+      content: [%Node{tag: "timeout"}]
+    }
+
+    assert {:error, {:disconnected, :timed_out, 408}} =
+             ConnectionProcess.dispatch(timed_out, state)
+
+    conflict = %Node{tag: "stream:error", content: [%Node{tag: "conflict"}]}
+
+    assert {:error, {:disconnected, :connection_replaced, 440}} =
+             ConnectionProcess.dispatch(conflict, state)
+  end
+
+  test "preserves connection failure status codes", %{state: state} do
+    failure = %Node{tag: "failure", attrs: %{"reason" => "401"}}
+
+    assert {:error, {:disconnected, :logged_out, 401}} =
+             ConnectionProcess.dispatch(failure, state)
+  end
+
+  test "preserves WebSocket upgrade status codes", %{state: state} do
+    error = %{status_code: 503}
+
+    assert {:stop, {:shutdown, {:disconnected, :service_unavailable, 503}}, ^state} =
+             ConnectionProcess.handle_info({:transport_error, error}, state)
+  end
+
   test "emits one timestamped status per batched receipt id and acknowledges once", %{
     state: state
   } do

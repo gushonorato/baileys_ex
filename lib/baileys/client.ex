@@ -13,7 +13,7 @@ defmodule Baileys.Client do
     Connection,
     ContactUpdate,
     DefaultDisappearingMode,
-    Disconnected,
+    DisconnectReason,
     Error,
     GroupJoinRequest,
     GroupMetadata,
@@ -479,13 +479,12 @@ defmodule Baileys.Client do
         {:DOWN, reference, :process, connection, reason},
         %{connection: connection, connection_monitor: reference} = state
       ) do
-    if reason not in [:normal, :shutdown] do
+    if reason not in [:normal, :shutdown] and not DisconnectReason.expected_exit?(reason) do
       notify(state, {:error, %Error{message: "connection exited: #{inspect(reason)}"}})
     end
 
     restart? = state.status == :restarting
-    disconnect_reason = if restart?, do: :restart_required, else: :connection_closed
-    notify(state, {:disconnected, %Disconnected{reason: disconnect_reason}})
+    notify(state, {:disconnected, DisconnectReason.from_exit(reason, state.status)})
 
     state =
       state

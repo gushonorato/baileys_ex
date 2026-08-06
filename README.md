@@ -201,9 +201,19 @@ messages arrive should use a terminal UI/readline library.
 %Baileys.Event{client: client, type: :group_join_request, data: %Baileys.GroupJoinRequest{}}
 %Baileys.Event{client: client, type: :text_message, data: %Baileys.TextMessage{}}
 %Baileys.Event{client: client, type: :message_status, data: %Baileys.MessageStatus{}}
-%Baileys.Event{client: client, type: :disconnected, data: %Baileys.Disconnected{}}
+%Baileys.Event{
+  client: client,
+  type: :disconnected,
+  data: %Baileys.Disconnected{reason: reason, code: code}
+}
 %Baileys.Event{client: client, type: :error, data: %Baileys.Error{}}
 ```
+
+Disconnect events preserve the server or transport reason and its status code.
+Recoverable conditions such as `:connection_lost`, `:timed_out`,
+`:service_unavailable`, and `:restart_required` remain distinct from conditions
+that can require a new pairing, such as `:logged_out`, `:bad_session`, and
+`:connection_replaced`. Retry and alert policy belongs to the application.
 
 `:messages_upsert` is the authoritative complete-message event. It preserves the
 decoded protobuf content, original wrappers, raw protobuf bytes, complete key

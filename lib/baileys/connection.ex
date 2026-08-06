@@ -10,6 +10,7 @@ defmodule Baileys.ConnectionProcess do
   alias Baileys.{AppState, Calls, Crypto, Noise}
   alias Baileys.HistorySync
   alias Baileys.JID
+  alias Baileys.DisconnectReason
   alias Baileys.Protocol.Handshake
   alias Baileys.Protocol.{Pairing, USync}
   alias Baileys.Proto.Message
@@ -184,11 +185,16 @@ defmodule Baileys.ConnectionProcess do
     end
   end
 
-  def handle_info({:transport_error, reason}, state), do: stop_with_error(reason, state)
-  def handle_info({:transport_closed, reason}, state), do: stop_with_error(reason, state)
+  def handle_info({:transport_error, reason}, state) do
+    stop_with_error(DisconnectReason.from_transport_error(reason), state)
+  end
+
+  def handle_info({:transport_closed, _reason}, state) do
+    stop_with_error(DisconnectReason.connection_closed(), state)
+  end
 
   def handle_info(:next_qr, %{qr_refs: []} = state) do
-    stop_with_error(:qr_timeout, %{state | qr_timer: nil})
+    stop_with_error(DisconnectReason.timed_out(), %{state | qr_timer: nil})
   end
 
   def handle_info(:next_qr, state) do
@@ -660,9 +666,14 @@ defmodule Baileys.ConnectionProcess do
     end
   end
 
-  defp handle_node(%Node{tag: tag}, _state) when tag in ["stream:error", "xmlstreamend"] do
-    {:error, :restart_required}
-  end
+  defp handle_node(%Node{tag: "stream:error"} = node, _state),
+    do: {:error, DisconnectReason.from_stream(node)}
+
+  defp handle_node(%Node{tag: "failure"} = node, _state),
+    do: {:error, DisconnectReason.from_failure(node)}
+
+  defp handle_node(%Node{tag: "xmlstreamend"}, _state),
+    do: {:error, DisconnectReason.connection_closed()}
 
   defp handle_node(_node, state), do: {:ok, state}
 
@@ -1120,8 +1131,11 @@ defmodule Baileys.ConnectionProcess do
     do: Map.get(state, :monotonic_now, fn -> System.monotonic_time(:millisecond) end)
 
   defp handle_ib_node(node, state) do
-    case NodeUtils.child(node, "edge_routing") do
-      %Node{} = edge ->
+    cond do
+      NodeUtils.child(node, "downgrade_webclient") ->
+        {:error, DisconnectReason.multidevice_mismatch()}
+
+      edge = NodeUtils.child(node, "edge_routing") ->
         case NodeUtils.child(edge, "routing_info") do
           %Node{content: routing_info} when is_binary(routing_info) ->
             credentials = %{state.credentials | routing_info: routing_info}
@@ -1135,7 +1149,7 @@ defmodule Baileys.ConnectionProcess do
             {:ok, state}
         end
 
-      nil ->
+      true ->
         {:ok, state}
     end
   end
@@ -1237,8 +1251,8 @@ defmodule Baileys.ConnectionProcess do
     %{state | qr_refs: refs, qr_timer: timer, qr_count: state.qr_count + 1}
   end
 
-  defp stop_with_error(:restart_required, state) do
-    {:stop, :normal, state}
+  defp stop_with_error({:disconnected, _reason, _code} = reason, state) do
+    {:stop, DisconnectReason.exit_reason(reason), state}
   end
 
   defp stop_with_error(reason, state) do
