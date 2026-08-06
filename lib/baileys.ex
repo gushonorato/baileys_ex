@@ -50,8 +50,8 @@ defmodule Baileys do
   @doc """
   Starts a callback module using `GenServer.start_link/3`-style arguments.
 
-  `:store` is required and must be an adapter/options tuple. The deprecated
-  `:sessions_path` option is rejected.
+  `:store` accepts an adapter/options tuple. Existing `:sessions_path`
+  configurations remain supported as shorthand for `Baileys.Store.File`.
   """
   @spec start_link(module(), term(), keyword()) :: GenServer.on_start()
   def start_link(module, init_arg, options \\ []) when is_atom(module) and is_list(options) do
@@ -61,6 +61,20 @@ defmodule Baileys do
   def connect(client), do: command(client, :connect, 30_000)
   def disconnect(client), do: command(client, :disconnect, 30_000)
   def logout(client), do: command(client, :logout, 30_000)
+
+  @doc """
+  Replaces the configured session with fresh credentials.
+
+  Any current connection is stopped before the store is changed. By default a
+  new connection is started immediately, allowing the client to emit a fresh
+  QR code. Pass `reconnect: false` to leave the client disconnected.
+
+  Store and reconnect failures are returned to the caller.
+  """
+  @spec reset_session(GenServer.server(), keyword()) :: :ok | {:error, term()}
+  def reset_session(client, options \\ []) do
+    command(client, {:reset_session, options}, 30_000)
+  end
 
   def request_pairing_code(client, phone, options \\ []) do
     command(client, {:pairing_code, phone, options}, 30_000)

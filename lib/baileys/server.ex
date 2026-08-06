@@ -8,7 +8,7 @@ defmodule Baileys.Server do
   alias Baileys.Store
 
   @gen_server_options [:name, :timeout, :debug, :spawn_opt, :hibernate_after]
-  @client_options [:session, :store, :request_timeout]
+  @client_options [:session, :store, :sessions_path, :request_timeout]
 
   def start_link(module, init_arg, options) do
     with :ok <- validate_store(options) do
@@ -103,6 +103,7 @@ defmodule Baileys.Server do
   defp run_command(client, :connect), do: Client.connect(client)
   defp run_command(client, :disconnect), do: Client.disconnect(client)
   defp run_command(client, :logout), do: Client.logout(client)
+  defp run_command(client, {:reset_session, options}), do: Client.reset_session(client, options)
 
   defp run_command(client, {:pairing_code, phone, options}),
     do: Client.request_pairing_code(client, phone, options)
@@ -121,17 +122,26 @@ defmodule Baileys.Server do
 
   defp validate_store(options) do
     cond do
-      Keyword.has_key?(options, :sessions_path) ->
-        {:error, {:unsupported_option, :sessions_path}}
-
-      not Keyword.has_key?(options, :store) ->
-        {:error, :store_required}
-
-      not Store.valid_config?(Keyword.fetch!(options, :store)) ->
+      Keyword.has_key?(options, :store) and
+          not Store.valid_config?(Keyword.fetch!(options, :store)) ->
         {:error, :invalid_store}
 
-      true ->
+      Keyword.has_key?(options, :store) ->
         :ok
+
+      Keyword.has_key?(options, :sessions_path) ->
+        validate_sessions_path(Keyword.fetch!(options, :sessions_path))
+
+      true ->
+        {:error, :store_required}
     end
   end
+
+  defp validate_sessions_path(path) when is_binary(path) do
+    if Path.type(path) == :absolute,
+      do: :ok,
+      else: {:error, :sessions_path_must_be_absolute}
+  end
+
+  defp validate_sessions_path(_path), do: {:error, :invalid_sessions_path}
 end

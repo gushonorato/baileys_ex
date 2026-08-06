@@ -11,6 +11,39 @@ defmodule BaileysTest.Handler do
   end
 end
 
+defmodule BaileysTest.FakeConnection do
+  use GenServer
+
+  def start_link(owner, _credentials, _options), do: GenServer.start_link(__MODULE__, owner)
+  def close(connection), do: GenServer.call(connection, :close)
+
+  @impl true
+  def init(owner) do
+    send(owner, {:connection_event, {:connection, :connecting}})
+    send(owner, {:connection_event, {:qr, "fresh-qr"}})
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call(:close, _from, state), do: {:stop, :normal, :ok, state}
+end
+
+defmodule BaileysTest.ResetFailureStore do
+  @behaviour Baileys.Store.Adapter
+
+  @impl true
+  def init(_options), do: {:ok, nil}
+
+  @impl true
+  def fetch(_state, _session), do: :not_found
+
+  @impl true
+  def put(_state, _session, _payload), do: :ok
+
+  @impl true
+  def delete(_state, _session), do: {:error, :read_only}
+end
+
 defmodule BaileysTest do
   use ExUnit.Case, async: true
 
@@ -95,7 +128,7 @@ defmodule BaileysTest do
              )
   end
 
-  test "requires an explicit valid store and rejects sessions_path" do
+  test "requires a valid store and preserves sessions_path compatibility" do
     assert {:error, :store_required} =
              Baileys.start_link(BaileysTest.Handler, self(), connect: false)
 
@@ -111,11 +144,23 @@ defmodule BaileysTest do
                store: {String, []}
              )
 
-    assert {:error, {:unsupported_option, :sessions_path}} =
+    root = Path.join(System.tmp_dir!(), "baileys-legacy-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, legacy} =
              Baileys.start_link(BaileysTest.Handler, self(),
                connect: false,
-               store: {Baileys.Store.Memory, []},
-               sessions_path: "/tmp/unsupported"
+               session: "legacy",
+               sessions_path: root
+             )
+
+    assert File.exists?(Path.join(root, "legacy.json"))
+    GenServer.stop(legacy)
+
+    assert {:error, :sessions_path_must_be_absolute} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               sessions_path: "relative/sessions"
              )
 
     assert {:error, {:store, :root_must_be_absolute}} =
@@ -123,5 +168,74 @@ defmodule BaileysTest do
                connect: false,
                store: {Baileys.Store.File, root: "relative/sessions"}
              )
+  end
+
+  test "reset_session stops the current connection and installs fresh credentials" do
+    assert {:ok, server} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: {Baileys.Store.Memory, []}
+             )
+
+    client = :sys.get_state(server).client
+    original = :sys.get_state(client).credentials
+    {:ok, connection} = BaileysTest.FakeConnection.start_link(self(), original, [])
+    external_monitor = Process.monitor(connection)
+
+    :sys.replace_state(client, fn state ->
+      %{
+        state
+        | connection: connection,
+          connection_monitor: Process.monitor(connection),
+          status: :online,
+          options: Keyword.put(state.options, :connection_module, BaileysTest.FakeConnection)
+      }
+    end)
+
+    assert :ok = Baileys.reset_session(server, reconnect: false)
+    assert_receive {:DOWN, ^external_monitor, :process, ^connection, :normal}
+
+    reset = :sys.get_state(client)
+    refute reset.credentials == original
+    assert reset.connection == nil
+    assert Baileys.status(server) == :disconnected
+    assert Process.alive?(server)
+  end
+
+  test "reset_session reconnects by default and emits a new QR" do
+    assert {:ok, client} =
+             Baileys.Client.start(
+               owner: self(),
+               store: {Baileys.Store.Memory, []},
+               connection_module: BaileysTest.FakeConnection
+             )
+
+    original = :sys.get_state(client).credentials
+    assert :ok = Baileys.reset_session(client)
+
+    assert_receive {:baileys, ^client, {:qr, %Baileys.QR{payload: "fresh-qr"}}}
+    refute :sys.get_state(client).credentials == original
+    assert Baileys.status(client) == :awaiting_pairing
+
+    assert :ok = Baileys.disconnect(client)
+    GenServer.stop(client)
+  end
+
+  test "reset_session exposes store failures and leaves the client usable" do
+    assert {:ok, server} =
+             Baileys.start_link(BaileysTest.Handler, self(),
+               connect: false,
+               store: {BaileysTest.ResetFailureStore, []}
+             )
+
+    client = :sys.get_state(server).client
+    original = :sys.get_state(client).credentials
+
+    assert {:error, {:store, :read_only}} =
+             Baileys.reset_session(server, reconnect: false)
+
+    assert :sys.get_state(client).credentials == original
+    assert Baileys.status(server) == :disconnected
+    assert Process.alive?(server)
   end
 end

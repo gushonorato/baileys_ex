@@ -56,6 +56,9 @@ defmodule Baileys.Client do
   def disconnect(client), do: GenServer.call(client, :disconnect, 30_000)
   def logout(client), do: GenServer.call(client, :logout, 30_000)
 
+  def reset_session(client, options),
+    do: GenServer.call(client, {:reset_session, options}, 30_000)
+
   def request_pairing_code(client, phone, options) do
     GenServer.call(client, {:pairing_code, phone, options}, 30_000)
   end
@@ -104,6 +107,7 @@ defmodule Baileys.Client do
          status: :disconnected,
          connection: nil,
          connection_monitor: nil,
+         reconnect_timer: nil,
          credentials: credentials,
          store: store,
          options: options,
@@ -126,6 +130,9 @@ defmodule Baileys.Client do
     do: handle_call(:disconnect, from, state)
 
   def handle_call({:baileys_command, :logout}, from, state), do: handle_call(:logout, from, state)
+
+  def handle_call({:baileys_command, {:reset_session, options}}, from, state),
+    do: handle_call({:reset_session, options}, from, state)
 
   def handle_call({:baileys_command, {:pairing_code, phone, options}}, from, state),
     do: handle_call({:pairing_code, phone, options}, from, state)
@@ -153,22 +160,15 @@ defmodule Baileys.Client do
   def handle_call(:connect, _from, state), do: start_connection(state)
 
   def handle_call(:disconnect, _from, %{connection: nil} = state) do
-    {:reply, :ok, state |> cancel_history_pause() |> Map.put(:status, :disconnected)}
+    {:reply, :ok,
+     state
+     |> cancel_reconnect()
+     |> cancel_history_pause()
+     |> Map.put(:status, :disconnected)}
   end
 
   def handle_call(:disconnect, _from, state) do
-    Process.demonitor(state.connection_monitor, [:flush])
-
-    if Process.alive?(state.connection) do
-      try do
-        ConnectionProcess.close(state.connection)
-      catch
-        :exit, _reason -> :ok
-      end
-    end
-
-    state = cancel_history_pause(state)
-    {:reply, :ok, %{state | connection: nil, connection_monitor: nil, status: :disconnected}}
+    {:reply, :ok, disconnect_state(state)}
   end
 
   def handle_call(
@@ -179,29 +179,10 @@ defmodule Baileys.Client do
       when is_pid(connection) do
     case ConnectionProcess.logout(connection, jid) do
       {:ok, _reply} ->
-        Process.demonitor(state.connection_monitor, [:flush])
-        ConnectionProcess.close(connection)
+        state = disconnect_state(state)
 
-        state =
-          state
-          |> cancel_history_pause()
-          |> stop_history_worker()
-
-        with {:ok, credentials} <- Store.reset(state.store) do
-          {:reply, :ok,
-           %{
-             state
-             | connection: nil,
-               connection_monitor: nil,
-               credentials: credentials,
-               status: :disconnected,
-               history_queue: :queue.new(),
-               history_worker: nil,
-               history_pause_timer: nil,
-               history_completed: MapSet.new(),
-               history_retries: %{}
-           }}
-        else
+        case Store.reset(state.store) do
+          {:ok, credentials} -> {:reply, :ok, fresh_session_state(state, credentials)}
           {:error, reason} -> {:reply, {:error, reason}, state}
         end
 
@@ -214,6 +195,31 @@ defmodule Baileys.Client do
 
   def handle_call(:logout, _from, state) do
     {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:reset_session, options}, _from, state) do
+    with {:ok, reconnect?} <- reset_reconnect(options) do
+      state = disconnect_state(state)
+
+      case Store.reset(state.store) do
+        {:ok, credentials} ->
+          state = fresh_session_state(state, credentials)
+
+          if reconnect? do
+            case start_connection_state(state) do
+              {:ok, state} -> {:reply, :ok, state}
+              {:error, reason} -> {:reply, {:error, reason}, state}
+            end
+          else
+            {:reply, :ok, state}
+          end
+
+        {:error, reason} ->
+          {:reply, {:error, reason}, state}
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:pairing_code, phone, options}, _from, %{connection: connection} = state)
@@ -490,7 +496,7 @@ defmodule Baileys.Client do
       |> cancel_history_pause()
       |> Map.merge(%{connection: nil, connection_monitor: nil, status: :disconnected})
 
-    if restart?, do: Process.send_after(self(), :reconnect, 500)
+    state = if restart?, do: schedule_reconnect(state), else: state
     {:noreply, state}
   end
 
@@ -504,7 +510,12 @@ defmodule Baileys.Client do
     {:noreply, %{state | subscribers: subscribers}}
   end
 
-  def handle_info(:reconnect, %{connection: nil} = state) do
+  def handle_info(
+        {:reconnect, token},
+        %{connection: nil, reconnect_timer: {_timer, token}} = state
+      ) do
+    state = %{state | reconnect_timer: nil}
+
     case start_connection_state(state) do
       {:ok, state} ->
         {:noreply, state}
@@ -515,7 +526,7 @@ defmodule Baileys.Client do
     end
   end
 
-  def handle_info(:reconnect, state), do: {:noreply, state}
+  def handle_info({:reconnect, _token}, state), do: {:noreply, state}
 
   defp start_connection(state) do
     case start_connection_state(state) do
@@ -526,8 +537,9 @@ defmodule Baileys.Client do
 
   defp start_connection_state(state) do
     connection_options = Keyword.put(state.options, :store, state.store)
+    connection_module = connection_module(state)
 
-    case ConnectionProcess.start_link(self(), state.credentials, connection_options) do
+    case connection_module.start_link(self(), state.credentials, connection_options) do
       {:ok, connection} ->
         Process.unlink(connection)
         monitor = Process.monitor(connection)
@@ -548,16 +560,29 @@ defmodule Baileys.Client do
 
   defp fetch_store(options) do
     cond do
-      Keyword.has_key?(options, :sessions_path) ->
-        {:error, {:unsupported_option, :sessions_path}}
-
       Keyword.has_key?(options, :store) ->
         {:ok, Keyword.fetch!(options, :store)}
+
+      Keyword.has_key?(options, :sessions_path) ->
+        {:ok, {Baileys.Store.File, root: Keyword.fetch!(options, :sessions_path)}}
 
       true ->
         {:error, :store_required}
     end
   end
+
+  defp reset_reconnect(options) when is_list(options) do
+    if Keyword.keyword?(options) and Keyword.keys(options) -- [:reconnect] == [] do
+      case Keyword.get(options, :reconnect, true) do
+        reconnect? when is_boolean(reconnect?) -> {:ok, reconnect?}
+        _value -> {:error, :invalid_reconnect}
+      end
+    else
+      {:error, :invalid_reset_options}
+    end
+  end
+
+  defp reset_reconnect(_options), do: {:error, :invalid_reset_options}
 
   defp message_timestamp(%DateTime{} = timestamp), do: timestamp
   defp message_timestamp(timestamp), do: DateTime.from_unix!(timestamp)
@@ -950,6 +975,91 @@ defmodule Baileys.Client do
   defp cancel_history_pause(state) do
     cancel_timer(Map.get(state, :history_pause_timer))
     Map.put(state, :history_pause_timer, nil)
+  end
+
+  defp disconnect_state(state) do
+    state =
+      state
+      |> cancel_reconnect()
+      |> cancel_history_pause()
+      |> stop_history_worker()
+
+    stop_connection(state)
+
+    Map.merge(state, %{
+      connection: nil,
+      connection_monitor: nil,
+      status: :disconnected
+    })
+  end
+
+  defp stop_connection(%{connection: connection} = state) when is_pid(connection) do
+    monitor = Map.get(state, :connection_monitor)
+
+    if Process.alive?(connection) do
+      try do
+        connection_module(state).close(connection)
+      rescue
+        _error -> :ok
+      catch
+        :exit, _reason -> :ok
+      end
+
+      await_connection_stop(connection, monitor)
+    end
+
+    if is_reference(monitor), do: Process.demonitor(monitor, [:flush])
+    :ok
+  end
+
+  defp stop_connection(_state), do: :ok
+
+  defp await_connection_stop(connection, monitor) when is_reference(monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^connection, _reason} -> :ok
+    after
+      5_000 ->
+        if Process.alive?(connection), do: Process.exit(connection, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^connection, _reason} -> :ok
+        after
+          1_000 -> :ok
+        end
+    end
+  end
+
+  defp await_connection_stop(connection, _monitor) do
+    if Process.alive?(connection), do: Process.exit(connection, :kill)
+    :ok
+  end
+
+  defp fresh_session_state(state, credentials) do
+    Map.merge(state, %{
+      credentials: credentials,
+      status: :disconnected,
+      history_queue: :queue.new(),
+      history_worker: nil,
+      history_pause_timer: nil,
+      history_completed: MapSet.new(),
+      history_retries: %{}
+    })
+  end
+
+  defp schedule_reconnect(state) do
+    state = cancel_reconnect(state)
+    token = make_ref()
+    timer = Process.send_after(self(), {:reconnect, token}, 500)
+    Map.put(state, :reconnect_timer, {timer, token})
+  end
+
+  defp cancel_reconnect(state) do
+    cancel_timer(Map.get(state, :reconnect_timer))
+    Map.put(state, :reconnect_timer, nil)
+  end
+
+  defp connection_module(state) do
+    Keyword.get(state.options, :connection_module, ConnectionProcess)
   end
 
   defp stop_history_worker(

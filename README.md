@@ -69,14 +69,32 @@ end
 `client` field can be used for synchronous commands inside the callback without
 calling the callback process itself.
 
-`store` is required; there is no implicit in-memory fallback. The old
-`sessions_path` option is unsupported. Credentials, prekeys, direct Signal
-sessions and group sender-key records use a versioned JSON schema with Base64
-for binary fields. Schema v2 adds sender-key storage, schema v3 adds non-secret
-account settings/privacy tokens, and schema v4 adds resumable
-history/app-state data. Do not run two clients against the same session.
-Base64 is an encoding, not encryption; stored payloads contain secrets and must
-not be shared or committed.
+An explicit `store` is preferred; there is no implicit in-memory fallback. For
+compatibility, `sessions_path: "/absolute/path"` remains shorthand for
+`store: {Baileys.Store.File, root: "/absolute/path"}` when `store` is absent.
+If both are supplied, `store` takes precedence. Credentials, prekeys, direct
+Signal sessions and group sender-key records use a versioned JSON schema with
+Base64 for binary fields. Schema v2 adds sender-key storage, schema v3 adds
+non-secret account settings/privacy tokens, and schema v4 adds resumable
+history/app-state data. Base64 is an encoding, not encryption; stored payloads
+contain secrets and must not be shared or committed.
+
+### Resetting an invalid session
+
+`logout/1` asks WhatsApp to remove an authenticated linked device. When the
+session has already been invalidated or removed on the phone, reset it locally
+without reaching into store modules:
+
+```elixir
+:ok = Baileys.reset_session(client, reconnect: true)
+```
+
+The current connection is stopped, the configured store session is deleted,
+fresh credentials are persisted, and the same client process reconnects and
+starts emitting QR events. Reconnection defaults to `true`; use
+`reconnect: false` to leave the client disconnected. A store failure is returned
+as `{:error, {:store, reason}}`, and S3 conditional-write races are returned as
+`{:error, {:store, :conflict}}`.
 
 ### Storage adapters
 
@@ -116,6 +134,33 @@ store: {
 `baileys/primary.json`. For S3-compatible services, pass ExAws overrides such as
 `ex_aws_options: [scheme: "http://", host: "localhost", port: 9000]`. Requests
 always use the official `ExAws.Request.Req` HTTP adapter.
+
+S3 objects are atomically replaced by `PutObject`. The adapter remembers the
+ETag returned by each load/save and requires it with `If-Match` for updates and
+deletes. New sessions use `If-None-Match: *`. HTTP 409/412 is an explicit
+`:conflict`; the adapter never retries as an unconditional overwrite. A missing
+ETag is also an error. `Baileys.Store` supplies load/create, save and reset on
+top of the adapter's fetch, put and idempotent delete operations.
+
+To encrypt the JSON on the client before upload, configure an encryption
+adapter. The built-in AES-256-GCM adapter accepts a Base64-encoded 32-byte key,
+generates a new nonce for every write and authenticates the S3 object key:
+
+```elixir
+store: {
+  Baileys.Store.S3,
+  bucket: "my-baileys-sessions",
+  region: "sa-east-1",
+  prefix: "production/baileys",
+  encryption: {
+    Baileys.Store.S3.Encryption.AESGCM,
+    key_base64: System.fetch_env!("BAILEYS_SESSION_KEY")
+  }
+}
+```
+
+Changing or losing this key makes existing sessions unreadable. Custom
+client-side encryption can implement `Baileys.Store.S3.Encryption`.
 
 The minimum IAM object permissions are `s3:GetObject`, `s3:PutObject` and
 `s3:DeleteObject` for `<prefix>/*`. Grant `s3:ListBucket` on the bucket with an
