@@ -17,8 +17,12 @@ export WA_PROTO_SOURCE="$ROOT/proto/WAProto.proto"
 export WA_PROTO_TARGET="$TMP_DIR/WAProto.proto"
 elixir "$ROOT/scripts/normalize_wa_proto.exs"
 
-PROTOC_GEN_ELIXIR="$ROOT/deps/protobuf/protoc-gen-elixir"
-chmod +x "$PROTOC_GEN_ELIXIR"
+PROTOBUF_DIR="$ROOT/deps/protobuf"
+(
+  cd "$PROTOBUF_DIR"
+  MIX_ENV=prod mix escript.build
+)
+PROTOC_GEN_ELIXIR="$PROTOBUF_DIR/protoc-gen-elixir"
 
 mkdir -p "$ROOT/lib/baileys/proto/generated"
 protoc \

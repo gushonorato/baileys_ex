@@ -9,16 +9,24 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: "1.19.5"
           otp-version: "28.1"
 
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "32.0"
+      - name: Install protoc
+        env:
+          PROTOC_VERSION: "32.0"
+        run: |
+          archive="$RUNNER_TEMP/protoc.zip"
+          install_dir="$RUNNER_TEMP/protoc"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip -q "$archive" -d "$install_dir"
+          echo "$install_dir/bin" >> "$GITHUB_PATH"
 
       - run: mix deps.get
       - run: mix proto.check
