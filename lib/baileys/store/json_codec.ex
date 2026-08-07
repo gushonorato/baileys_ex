@@ -450,7 +450,7 @@ defmodule Baileys.Store.JSONCodec do
               "no_history",
               "message_access_status"
             ],
-       do: String.to_existing_atom(type)
+       do: String.to_atom(type)
 
   defp decode_app_state_keys(_value, version) when version in [1, 2, 3], do: {:ok, %{}}
 

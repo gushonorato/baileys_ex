@@ -48,6 +48,30 @@ defmodule Baileys.StoreTest do
     assert_receive {:put, "primary", ^payload}
   end
 
+  test "decodes persisted history sync types before their atoms exist" do
+    credentials = Credentials.new()
+    {:ok, payload} = JSONCodec.encode(credentials)
+
+    document = Jason.decode!(payload)
+
+    progress = %{
+      "non-blocking" => %{
+        "sync_type" => "non_blocking_data",
+        "progress" => 100
+      }
+    }
+
+    payload =
+      document
+      |> put_in(["credentials", "history_sync_progress"], progress)
+      |> Jason.encode!()
+
+    assert {:ok, decoded} = JSONCodec.decode(payload)
+
+    assert decoded.history_sync_progress["non-blocking"].sync_type
+           |> Atom.to_string() == "non_blocking_data"
+  end
+
   test "creates and persists credentials when the session does not exist" do
     assert {:ok, %Credentials{} = credentials, %Store{}} = open([])
     assert_receive {:fetch, "primary"}
