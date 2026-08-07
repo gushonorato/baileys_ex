@@ -11,24 +11,74 @@ defmodule Baileys do
       )
 
   Events are delivered to `c:handle_event/2` as `%Baileys.Event{}` values.
+  Application calls, casts, and ordinary messages can be handled by the
+  optional GenServer-like callbacks while the callback state remains in the
+  same `Baileys.Server` process.
+
+  `use Baileys` declares this behaviour and a child specification. It does not
+  call `use GenServer`: `Baileys.Server` remains the actual GenServer callback
+  module so its private runtime state cannot collide with application state.
+
+  The modern `c:format_status/1` callback receives a status map whose state is
+  only the application callback state. The deprecated `format_status/2`
+  callback is deliberately not delegated.
   """
 
   alias Baileys.Server
 
   @type callback_state :: term()
+  @type callback_action :: timeout() | :hibernate | {:continue, term()}
   @type event :: Baileys.Event.t()
 
   @callback init(init_arg :: term()) ::
               {:ok, callback_state()}
+              | {:ok, callback_state(), callback_action()}
               | {:stop, reason :: term()}
               | :ignore
 
   @callback handle_event(event(), callback_state()) ::
               {:noreply, callback_state()}
+              | {:noreply, callback_state(), callback_action()}
+              | {:stop, reason :: term(), callback_state()}
+
+  @callback handle_call(request :: term(), GenServer.from(), callback_state()) ::
+              {:reply, reply :: term(), callback_state()}
+              | {:reply, reply :: term(), callback_state(), callback_action()}
+              | {:noreply, callback_state()}
+              | {:noreply, callback_state(), callback_action()}
+              | {:stop, reason :: term(), reply :: term(), callback_state()}
+              | {:stop, reason :: term(), callback_state()}
+
+  @callback handle_cast(request :: term(), callback_state()) ::
+              {:noreply, callback_state()}
+              | {:noreply, callback_state(), callback_action()}
+              | {:stop, reason :: term(), callback_state()}
+
+  @callback handle_info(message :: term(), callback_state()) ::
+              {:noreply, callback_state()}
+              | {:noreply, callback_state(), callback_action()}
+              | {:stop, reason :: term(), callback_state()}
+
+  @callback handle_continue(continue_arg :: term(), callback_state()) ::
+              {:noreply, callback_state()}
+              | {:noreply, callback_state(), callback_action()}
               | {:stop, reason :: term(), callback_state()}
 
   @callback terminate(reason :: term(), callback_state()) :: term()
-  @optional_callbacks terminate: 2
+
+  @callback code_change(old_vsn :: term(), callback_state(), extra :: term()) ::
+              {:ok, callback_state()} | {:error, reason :: term()}
+
+  @callback format_status(status :: :gen_server.format_status()) ::
+              :gen_server.format_status()
+
+  @optional_callbacks handle_call: 3,
+                      handle_cast: 2,
+                      handle_info: 2,
+                      handle_continue: 2,
+                      terminate: 2,
+                      code_change: 3,
+                      format_status: 1
 
   defmacro __using__(_options) do
     quote location: :keep do
@@ -61,6 +111,29 @@ defmodule Baileys do
   @spec start_link(module(), term(), keyword()) :: GenServer.on_start()
   def start_link(module, init_arg, options \\ []) when is_atom(module) and is_list(options) do
     Server.start_link(module, init_arg, options)
+  end
+
+  @doc """
+  Makes a synchronous request to the callback module.
+
+  The request is delivered to handle_call/3 through a private envelope, so it
+  cannot collide with Baileys commands. As with GenServer.call/3, the caller
+  exits if the server exits or the timeout is exceeded.
+  """
+  @spec call(GenServer.server(), term(), timeout()) :: term()
+  def call(client, request, timeout \\ 5_000) do
+    GenServer.call(client, {:"$baileys_callback_call", request}, timeout)
+  end
+
+  @doc """
+  Sends an asynchronous request to the callback module.
+
+  The request is delivered to handle_cast/2 through a private envelope, so it
+  cannot collide with Baileys commands.
+  """
+  @spec cast(GenServer.server(), term()) :: :ok
+  def cast(client, request) do
+    GenServer.cast(client, {:"$baileys_callback_cast", request})
   end
 
   def connect(client), do: command(client, :connect, 30_000)

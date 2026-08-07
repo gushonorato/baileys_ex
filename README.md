@@ -34,12 +34,14 @@ defmodule MyWhatsApp do
   end
 
   @impl Baileys
-  def init(phone), do: {:ok, %{phone: phone}}
+  def init(phone) do
+    {:ok, %{phone: phone, qr: nil, value: nil}, {:continue, :load_state}}
+  end
 
   @impl Baileys
   def handle_event(%Baileys.Event{type: :qr, data: qr}, state) do
-    IO.inspect(qr.payload)
-    {:noreply, state}
+    Process.send_after(self(), {:expire_qr, qr.payload}, 60_000)
+    {:noreply, %{state | qr: qr}}
   end
 
   def handle_event(
@@ -50,24 +52,73 @@ defmodule MyWhatsApp do
     {:noreply, state}
   end
 
-  def handle_event(%Baileys.Event{type: :messages_upsert, data: upsert}, state) do
-    Enum.each(upsert.messages, &IO.inspect(&1, label: "complete message"))
-    {:noreply, state}
-  end
-
-  def handle_event(%Baileys.Event{type: :text_message, data: text}, state) do
-    IO.puts("legacy text projection: #{text.text}")
-    {:noreply, state}
-  end
-
   def handle_event(_event, state), do: {:noreply, state}
+
+  @impl Baileys
+  def handle_call(:pairing_state, _from, state) do
+    {:reply, %{qr: state.qr}, state}
+  end
+
+  @impl Baileys
+  def handle_cast({:put_value, value}, state) do
+    {:noreply, %{state | value: value}}
+  end
+
+  @impl Baileys
+  def handle_info({:expire_qr, payload}, %{qr: %{payload: payload}} = state) do
+    {:noreply, %{state | qr: nil}}
+  end
+
+  def handle_info(:reconnect, state) do
+    # Timers and ordinary process messages belong here.
+    {:noreply, state}
+  end
+
+  @impl Baileys
+  def handle_continue(:load_state, state) do
+    # Perform post-init work without delaying start_link/1 initialization.
+    {:noreply, state}
+  end
 end
+
+{:ok, client} = MyWhatsApp.start_link("+5511999999999")
+%{qr: qr} = Baileys.call(client, :pairing_state)
+:ok = Baileys.cast(client, {:put_value, 123})
+send(client, :reconnect)
 ```
 
+`handle_event/2` is reserved for typed WhatsApp protocol events. Application
+requests use `handle_call/3` through `Baileys.call/3`, asynchronous updates
+use `handle_cast/2` through `Baileys.cast/2`, and timers or ordinary messages
+use `handle_info/2`. Any of these callbacks, as well as `init/1`, may request
+`{:continue, term}`; it is then delivered to `handle_continue/2`.
+
 `Baileys` is the behaviour and `Baileys.start_link/3` follows the same
-`module, init_arg, options` shape as `GenServer.start_link/3`. The event's
-`client` field can be used for synchronous commands inside the callback without
-calling the callback process itself.
+`module, init_arg, options` shape as `GenServer.start_link/3`. `use Baileys`
+does **not** call `use GenServer`. The actual GenServer is `Baileys.Server`,
+which stores its private runtime state and the application's callback state in
+the same process while exposing only the latter to callbacks.
+
+Commands such as `connect/1`, client event envelopes, and the monitor for the
+internal `Baileys.Client` are reserved and handled before application
+messages. They never reach `handle_info/2`. An unrelated monitor `:DOWN`
+message is an application message and can reach `handle_info/2`. Use
+`Baileys.call/3` and `Baileys.cast/2` instead of raw `GenServer.call/3` or
+`GenServer.cast/2`; the public functions add private envelopes that cannot
+collide with Baileys commands.
+
+The event's `client` field is the internal client PID and can still be used for
+synchronous Baileys commands inside `handle_event/2` without calling the
+callback process itself.
+
+All GenServer-like callbacks are optional. A callback call or cast without
+`handle_call/3` or `handle_cast/2` stops the server, matching normal
+GenServer behavior. Without `handle_info/2`, ordinary messages are logged and
+ignored. Requesting a continuation without `handle_continue/2` stops the
+server. `code_change/3` may migrate only the callback state, while
+`format_status/1` receives a status map containing only that state. The
+deprecated `format_status/2` callback is not delegated; Elixir 1.19 supports
+the safer map-based `format_status/1`.
 
 An explicit `store` is preferred; there is no implicit in-memory fallback. For
 compatibility, `sessions_path: "/absolute/path"` remains shorthand for
