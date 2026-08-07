@@ -182,7 +182,14 @@ defmodule Baileys do
   defp command(client, command, timeout) do
     GenServer.call(client, {:baileys_command, command}, timeout)
   catch
-    :exit, _reason -> {:error, :not_connected}
+    :exit, {reason, _call} when reason in [:noproc, :normal, :shutdown] ->
+      {:error, :not_connected}
+
+    :exit, {{:shutdown, _reason}, _call} ->
+      {:error, :not_connected}
+
+    :exit, reason ->
+      exit(reason)
   end
 
   defp phone_jid(phone) do

@@ -28,6 +28,22 @@ defmodule BaileysTest.FakeConnection do
   def handle_call(:close, _from, state), do: {:stop, :normal, :ok, state}
 end
 
+defmodule BaileysTest.CrashingCommandServer do
+  use GenServer
+
+  def start_link(mode \\ :raise), do: GenServer.start_link(__MODULE__, mode)
+
+  @impl true
+  def init(mode), do: {:ok, mode}
+
+  @impl true
+  def handle_call({:baileys_command, :status}, _from, :raise), do: raise("command failed")
+
+  def handle_call({:baileys_command, :status}, _from, {:stop, reason}) do
+    {:stop, reason, nil}
+  end
+end
+
 defmodule BaileysTest.ResetFailureStore do
   @behaviour Baileys.Store.Adapter
 
@@ -73,6 +89,33 @@ defmodule BaileysTest do
   test "normalizes phone numbers through the Baileys facade" do
     assert Baileys.jid("+55 (21) 98639-9132") ==
              {:ok, "5521986399132@s.whatsapp.net"}
+  end
+
+  test "normalizes unavailable command targets but preserves unexpected exits" do
+    unavailable =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    reference = Process.monitor(unavailable)
+    send(unavailable, :stop)
+    assert_receive {:DOWN, ^reference, :process, ^unavailable, :normal}
+
+    assert {:error, :not_connected} = Baileys.status(unavailable)
+
+    for reason <- [:normal, :shutdown, {:shutdown, :maintenance}] do
+      assert {:ok, stopping} = BaileysTest.CrashingCommandServer.start_link({:stop, reason})
+      Process.unlink(stopping)
+      assert {:error, :not_connected} = Baileys.status(stopping)
+    end
+
+    assert {:ok, crashing} = BaileysTest.CrashingCommandServer.start_link()
+    Process.unlink(crashing)
+
+    assert {{%RuntimeError{message: "command failed"}, _stack}, _call} =
+             catch_exit(Baileys.status(crashing))
   end
 
   test "delivers the original disconnect reason and code in the callback event" do

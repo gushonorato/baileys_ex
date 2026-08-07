@@ -27,4 +27,9 @@ defmodule Baileys.Binary.CodecTest do
     node = %Node{tag: "enc", attrs: %{"type" => "msg"}, content: <<0, 1, 2, 255>>}
     assert {:ok, ^node} = node |> Codec.encode() |> Codec.decode()
   end
+
+  test "round trips binary content at the binary 20 boundary" do
+    node = %Node{tag: "enc", content: :binary.copy(<<1>>, 256)}
+    assert {:ok, ^node} = node |> Codec.encode() |> Codec.decode()
+  end
 end

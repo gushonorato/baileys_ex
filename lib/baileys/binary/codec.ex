@@ -106,7 +106,7 @@ defmodule Baileys.Binary.Codec do
     cond do
       length >= 1 <<< 32 -> raise ArgumentError, "binary node value is too large"
       length >= 1 <<< 20 -> <<@binary_32, length::32, value::binary>>
-      length >= 256 -> <<@binary_20, length::20, value::binary>>
+      length >= 256 -> <<@binary_20, 0::4, length::20, value::binary>>
       true -> <<@binary_8, length, value::binary>>
     end
   end
